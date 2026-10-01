@@ -27,6 +27,10 @@ extern EnvironmentSensorManager sensors;
   extern MomentaryButton user_btn;
   extern MomentaryButton joystick_left;
   extern MomentaryButton joystick_right;
+#ifdef WITH_MESH_SLIM
+  extern MomentaryButton joystick_up;
+  extern MomentaryButton joystick_down;
+#endif
   extern MomentaryButton back_btn;
 #endif
 

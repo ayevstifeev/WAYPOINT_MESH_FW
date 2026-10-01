@@ -45,6 +45,13 @@ public:
   bool deleteBlobByKey(const uint8_t key[], int key_len);
   File openRead(const char* filename);
   File openRead(FILESYSTEM* fs, const char* filename);
+#if defined(WITH_TRACKER_MODE) || defined(WITH_MESH_SLIM)
+  // Replace a file; see TrackerMode.h. Both overloads, like openRead: a member
+  // of this name hides the file-static openWrite(fs, name) the other methods
+  // call, so the two-argument one has to exist here too.
+  File openWrite(const char* filename);
+  File openWrite(FILESYSTEM* fs, const char* filename);
+#endif
   bool removeFile(const char* filename);
   bool removeFile(FILESYSTEM* fs, const char* filename);
   uint32_t getStorageUsedKb() const;

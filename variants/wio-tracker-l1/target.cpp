@@ -24,6 +24,17 @@ EnvironmentSensorManager sensors = EnvironmentSensorManager();
   MomentaryButton user_btn(PIN_USER_BTN, 1000, true, false, false);
   MomentaryButton joystick_left(JOYSTICK_LEFT, 1000, true, false, false);
   MomentaryButton joystick_right(JOYSTICK_RIGHT, 1000, true, false, false);
+#ifdef WITH_MESH_SLIM
+  // Up and down have been on the board and in variant.h from the start,
+  // and were never read. A menu can be walked with two directions; a
+  // character cannot be chosen out of sixty-four.
+  // Guarded not because up and down are a MESH_SLIM feature - they are two
+  // switches on the board - but because the screens that read them are, and
+  // a stock build is held byte-identical to upstream on purpose. The day a
+  // non-slim screen wants them, this guard is the only thing to remove.
+  MomentaryButton joystick_up(JOYSTICK_UP, 1000, true, false, false);
+  MomentaryButton joystick_down(JOYSTICK_DOWN, 1000, true, false, false);
+#endif
   MomentaryButton back_btn(PIN_BACK_BTN, 1000, true, false, true);
 #endif
 

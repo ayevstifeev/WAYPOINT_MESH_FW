@@ -39,6 +39,55 @@ public:
   }
 
   virtual void setParams(float freq, float bw, uint8_t sf, uint8_t cr) = 0;
+
+#ifdef WITH_MESH_SLIM
+  //: Move the whole physical layer between MeshCore and MESH_SLIM.
+  //:
+  //: These settings are ONE decision, not four, and changing some without the
+  //: others leaves the radio in a state that is neither protocol:
+  //:
+  //:   sync word  0x12 -> 0x2B  the hardware network identifier. The SX126x
+  //:                            compares it before raising an RX interrupt, so
+  //:                            the two networks become mutually deaf at zero
+  //:                            CPU cost. This is also the safety interlock: a
+  //:                            half-flashed unit hears everything or nothing,
+  //:                            never a mis-parsed mixture.
+  //:   preamble     16 -> 8     40% of a 12-byte packet's airtime is preamble.
+  //:                            Below 8 the receiver starts missing packets.
+  //:   CRC          on -> off   the 4-byte MAC rejects corruption already, and
+  //:                            unlike a CRC it also rejects deliberate
+  //:                            corruption. Paying for both is paying twice.
+  //:
+  //: Returns false on radios that have no slim support, leaving them stock.
+  virtual bool setProtocolMode(bool slim) { (void)slim; return false; }
+#endif
+#ifdef WITH_TRACKER_MODE
+  //: Between tracker reports. A warm sleep keeps the chip's configuration -
+  //: sync word, preamble, CRC - so nothing has to be set up again; powerOff()
+  //: is a cold sleep on the SX1262 and would lose all of it. The next
+  //: recvRaw() starts receiving again, which is what wakes the chip.
+  void sleepWarm();
+
+  //: Sniff for a preamble instead of sleeping. Returns false on a radio
+  //: that cannot, and the caller sleeps as before.
+  //:
+  //: **For a unit that has lost the base.** One in contact is deaf for
+  //: all but ten seconds of each cycle, which costs nothing and is
+  //: perfectly sufficient: the base only has to answer a report, and it
+  //: does that inside the window. A unit that has lost the base has
+  //: nothing to wait for and no idea when anything will come, so instead
+  //: of sleeping it has the radio listen in short bursts, often enough
+  //: that no preamble can pass between two of them.
+  //:
+  //: The chip does this by itself and the processor sleeps through all of
+  //: it, waking only when a packet actually arrives. The cost is set by
+  //: the ratio of symbols, not by wall-clock time: a few symbols of
+  //: listening per preamble is about an eighth of the current of
+  //: listening properly, whatever the spreading factor. At SF12 and
+  //: 62.5 kHz that works out at a look roughly once a second; at SF11 and
+  //: 250 kHz, eight times as often for the same power.
+  virtual bool startSniffing() { return false; }
+#endif
   uint32_t getRngSeed();
   void setTxPower(int8_t dbm);
 

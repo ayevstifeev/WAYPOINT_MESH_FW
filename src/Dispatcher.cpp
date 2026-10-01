@@ -6,6 +6,10 @@
 
 #include <math.h>
 
+#ifdef WITH_MESH_SLIM
+  #include <helpers/slim/SlimProto.h>
+#endif
+
 namespace mesh {
 
 #define MAX_RX_DELAY_MILLIS        32000  // 32 seconds
@@ -148,6 +152,19 @@ void Dispatcher::loop() {
 bool Dispatcher::tryParsePacket(Packet* pkt, const uint8_t* raw, int len) {
   int i = 0;
 
+#ifdef WITH_MESH_SLIM
+  // MESH_SLIM has no MeshCore header: the frame is its own format from byte
+  // zero, so the whole buffer becomes the payload and the Packet is only the
+  // carrier. Authentication happens in the router, not here — this deliberately
+  // accepts anything of a plausible length and lets the tag reject it, so that
+  // a malformed packet and a forged one take the same path and the same time.
+  if (slimproto::active()) {
+    if (len < 7 || len > SLIM_MAX_FRAME) return false;
+    slimproto::frameToPacket(pkt, raw, (uint8_t)len);
+    return true;
+  }
+#endif
+
   pkt->header = raw[i++];
   if (pkt->getPayloadVer() > PAYLOAD_VER_1) {
     MESH_DEBUG_PRINTLN("%s Dispatcher::checkRecv(): unsupported packet version", getLogDateTime());
@@ -203,6 +220,9 @@ void Dispatcher::checkRecv() {
       } else {
         if (tryParsePacket(pkt, raw, len)) {
           pkt->_snr = _radio->getLastSNR() * 4.0f;
+#ifdef WITH_MESH_SLIM
+          pkt->_rssi = (int16_t)_radio->getLastRSSI();   // see Packet.h
+#endif
           score = _radio->packetScore(_radio->getLastSNR(), len);
           air_time = _radio->getEstAirtimeFor(len);
           rx_air_time += air_time;
@@ -308,6 +328,12 @@ void Dispatcher::checkSend() {
     int len = 0;
     uint8_t raw[MAX_TRANS_UNIT];
 
+#ifdef WITH_MESH_SLIM
+    // MESH_SLIM frames carry no MeshCore header and no path: the payload IS the
+    // frame. Leaving len at zero makes the payload memcpy below write it from
+    // byte zero, so the rest of this function needs no change at all.
+    if (!slimproto::active()) {
+#endif
     raw[len++] = outbound->header;
     if (outbound->hasTransportCodes()) {
       memcpy(&raw[len], &outbound->transport_codes[0], 2); len += 2;
@@ -315,6 +341,9 @@ void Dispatcher::checkSend() {
     }
     raw[len++] = outbound->path_len;
     len += Packet::writePath(&raw[len], outbound->path, outbound->path_len);
+#ifdef WITH_MESH_SLIM
+    }
+#endif
 
     if (len + outbound->payload_len > MAX_TRANS_UNIT) {
       MESH_DEBUG_PRINTLN("%s Dispatcher::checkSend(): FATAL: Invalid packet queued... too long, len=%d", getLogDateTime(), len + outbound->payload_len);
@@ -359,6 +388,9 @@ Packet* Dispatcher::obtainNewPacket() {
   } else {
     pkt->payload_len = pkt->path_len = 0;
     pkt->_snr = 0;
+#ifdef WITH_MESH_SLIM
+    pkt->_rssi = 0;
+#endif
   }
   return pkt;
 }

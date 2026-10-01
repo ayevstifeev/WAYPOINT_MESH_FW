@@ -27,6 +27,12 @@
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/ClientACL.h>
 #include <helpers/CommonCLI.h>
+#ifdef WITH_MESH_SLIM
+  #include <helpers/slim/SlimProto.h>
+  #include <helpers/slim/SlimText.h>
+  #include <helpers/slim/SlimHealth.h>
+  #include <helpers/slim/SlimApp.h>
+#endif
 #include <helpers/IdentityStore.h>
 #include <helpers/SimpleMeshTables.h>
 #include <helpers/StaticPoolPacketManager.h>
@@ -68,8 +74,20 @@ struct NeighbourInfo {
   int8_t snr; // multiplied by 4, user should divide to get float value
 };
 
+//: **When this image was compiled, not a number someone typed.**
+//:
+//: It was the fixed string "6 Jun 2026" and never moved, so `ver` answered
+//: the same thing on every build ever made. On 2026-10-01 a repeater was
+//: reflashed three times against that reply and it said "6 Jun 2026" each
+//: time, which is indistinguishable from an upload that silently did
+//: nothing - and that is exactly what had happened.
+//:
+//: One caveat worth knowing: __DATE__/__TIME__ are fixed when this
+//: translation unit is compiled, so an incremental build that does not
+//: recompile it leaves the old stamp. A changed build flag or `-t clean`
+//: recompiles everything, which is when it matters.
 #ifndef FIRMWARE_BUILD_DATE
-  #define FIRMWARE_BUILD_DATE   "6 Jun 2026"
+  #define FIRMWARE_BUILD_DATE   __DATE__ " " __TIME__
 #endif
 
 #ifndef FIRMWARE_VERSION
@@ -80,7 +98,11 @@ struct NeighbourInfo {
 
 #define PACKET_LOG_FILE  "/packet_log"
 
-class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
+class MyMesh : public mesh::Mesh, public CommonCLICallbacks
+#ifdef WITH_MESH_SLIM
+             , public slimproto::Handler
+#endif
+{
   FILESYSTEM* _fs;
   uint32_t last_millis;
   uint64_t uptime_millis;
@@ -90,6 +112,16 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   ClientACL  acl;
   CommonCLI _cli;
   uint8_t reply_data[MAX_PACKET_PAYLOAD];
+#ifdef WITH_MESH_SLIM
+  unsigned long _proto_restart_at = 0;   // restart when the queue is quiet...
+  unsigned long _proto_restart_by = 0;   // ...or by then, whatever it is doing
+  //: The newest admin timestamp acted on, so a recorded command cannot
+  //: be played back. Seeded from the clock at boot rather than from
+  //: zero, so a recording does not simply survive a power cut.
+  uint32_t _slim_admin_ts = 0;
+  void loadSlimProto();
+  void loadSlimUnit();
+#endif
   uint8_t reply_path[MAX_PATH_SIZE];
   int8_t  reply_path_len;
   uint8_t reply_path_hash_size;
@@ -225,6 +257,56 @@ public:
 
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   void loop();
+#ifdef WITH_MESH_SLIM
+  //: Save the protocol to start on, and restart once the queue is quiet.
+  //: False if this build cannot switch, or slim has no operation key.
+  bool saveSlimProto(bool on);
+  //: The base's "!S0 <name>" broadcast and its "!A" command line.
+  void onSlimRecv(const slim::Frame& f,
+                  const slimproto::Link& link) override;
+  //: Answer a health check: battery, temperature, uptime, signal and
+  //: counters in one frame. See slimhealth.
+  void sendSlimStatus(uint8_t to, uint16_t wanted, int ttl);
+  //: One slim frame onto the air. The only place this example obtains
+  //: a packet, so the release-on-failure path exists once.
+  void sendSlimFrame(uint8_t type, const uint8_t* body, uint8_t len,
+                     uint8_t to, int ttl, bool prefer_direct = true);
+  //: Say who this repeater is: callsign and public key, to everyone.
+  //:
+  //: A repeater has no position to report, so before this it was silent
+  //: except when relaying - and a base on a slim-only network had no
+  //: way to learn it existed, let alone address its command line.
+  void sendSlimAdvert();
+  //: When the next one goes out, in millis(). See the companion radio's
+  //: for why it repeats rather than going once at boot.
+  unsigned long _slim_advert_at = 0;
+  //: The volunteered health reading, on its own clock. Sent back to back
+  //: with the advert it contended with this node's own airtime and was
+  //: usually lost - one arrived all evening. Ten seconds apart, both are
+  //: heard.
+  unsigned long _slim_status_at = 0;
+  //: One line of CLI reply. `line` must already begin "!A"; see the
+  //: definition for why it is not copied to add it.
+  void sendSlimText(uint8_t to, char* line);
+  //: "!A<ts-hex> <command>" from the base. Silent for anything that is
+  //: not a well-formed admin frame, in which case nothing was run.
+  void handleSlimAdmin(uint8_t from, char* msg);
+
+  //: An answer owed, to be transmitted from loop() rather than from
+  //: inside the receive callback. Sending from onSlimRecv puts a
+  //: transmission in the middle of the dispatcher handling the packet
+  //: that prompted it, and the reply does not survive the trip.
+  uint8_t _slim_reply_to = 0;        // 0 = nothing owed
+  //: Not before this. The base asks as a burst of MESH_SLIM_BURST copies,
+  //: and a reply sent the instant the first copy lands is transmitted into
+  //: the second and third. The base waits 20 s for an answer, so a couple
+  //: of seconds of quiet costs nothing and is the difference between an
+  //: answer and a repeater that reads as dead.
+  unsigned long _slim_reply_at = 0;
+  uint16_t _slim_reply_want = 0;     // status fields, when replying to a ping
+  char _slim_reply_text[2 + 160];    // "!A..." when replying to a command
+  void sendPendingSlimReply();
+#endif
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {

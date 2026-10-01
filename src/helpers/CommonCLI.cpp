@@ -5,6 +5,10 @@
 #include "TxtDataHelpers.h"
 #include <RTClib.h>
 
+#ifdef WITH_MESH_SLIM
+  #include <helpers/slim/SlimProto.h>
+#endif
+
 #ifndef BRIDGE_MAX_BAUD
 #define BRIDGE_MAX_BAUD 115200
 #endif
@@ -292,6 +296,17 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
       savePrefs();
       sprintf(reply, "password now: ");
       StrHelper::strncpy(&reply[14], _prefs->password, 160-15);   // echo back just to let admin know for sure!!
+#ifdef WITH_MESH_SLIM
+    } else if (memcmp(command, "proto", 5) == 0 && (command[5] == 0 || command[5] == ' ')) {
+      // All the parsing lives in SlimProto so that this file gains four lines
+      // rather than eighty, and a rebase onto upstream has nothing to reconcile.
+      //
+      // millis() rather than _rtc: CommonCLI carries an RTCClock in epoch
+      // seconds, but route ages are millisecond-based and come from the
+      // Dispatcher's MillisecondClock, which is millis() on every Arduino
+      // target. Mixing the two units would age every route by a factor of 1000.
+      slimproto::cli(&command[5], reply, millis());
+#endif
     } else if (memcmp(command, "clear stats", 11) == 0) {
       _callbacks->clearStats();
       strcpy(reply, "(OK - stats reset)");

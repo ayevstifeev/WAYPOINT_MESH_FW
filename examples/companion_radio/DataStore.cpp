@@ -155,6 +155,15 @@ File DataStore::openRead(FILESYSTEM* fs, const char* filename) {
 #endif
 }
 
+#if defined(WITH_TRACKER_MODE) || defined(WITH_MESH_SLIM)
+File DataStore::openWrite(const char* filename) {
+  return ::openWrite(_fs, filename);   // the file-static helper savePrefs uses
+}
+File DataStore::openWrite(FILESYSTEM* fs, const char* filename) {
+  return ::openWrite(fs, filename);
+}
+#endif
+
 bool DataStore::removeFile(const char* filename) {
   return _fs->remove(filename);
 }

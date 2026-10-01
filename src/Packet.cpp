@@ -2,6 +2,10 @@
 #include <string.h>
 #include <SHA256.h>
 
+#ifdef WITH_MESH_SLIM
+  #include <helpers/slim/SlimProto.h>
+#endif
+
 namespace mesh {
 
 Packet::Packet() {
@@ -35,6 +39,13 @@ uint8_t Packet::copyPath(uint8_t* dest, const uint8_t* src, uint8_t path_len) {
 }
 
 int Packet::getRawLength() const {
+#ifdef WITH_MESH_SLIM
+  // A slim frame is its payload and nothing else - no header byte, no path_len
+  // byte. Without this the length runs two bytes long, and since it feeds
+  // getEstAirtimeFor() the duty-cycle and airtime accounting are wrong by ~15%
+  // on a 13-byte position, which is the number this protocol exists to move.
+  if (slimproto::active()) return payload_len;
+#endif
   return 2 + getPathByteLen() + payload_len + (hasTransportCodes() ? 4 : 0);
 }
 
@@ -51,6 +62,16 @@ void Packet::calculatePacketHash(uint8_t* hash) const {
 
 uint8_t Packet::writeTo(uint8_t dest[]) const {
   uint8_t i = 0;
+#ifdef WITH_MESH_SLIM
+  // Kept in step with Dispatcher::checkSend deliberately. This path is for
+  // storing a packet as a blob rather than for the radio, but a blob that does
+  // not round-trip to the same bytes that went on the air is a bug waiting for
+  // whoever next replays one.
+  if (slimproto::active()) {
+    memcpy(dest, payload, payload_len);
+    return (uint8_t)payload_len;
+  }
+#endif
   dest[i++] = header;
   if (hasTransportCodes()) {
     memcpy(&dest[i], &transport_codes[0], 2); i += 2;
@@ -64,6 +85,13 @@ uint8_t Packet::writeTo(uint8_t dest[]) const {
 
 bool Packet::readFrom(const uint8_t src[], uint8_t len) {
   uint8_t i = 0;
+#ifdef WITH_MESH_SLIM
+  if (slimproto::active()) {
+    if (len < 7 || len > SLIM_MAX_FRAME) return false;
+    slimproto::frameToPacket(this, src, len);
+    return true;
+  }
+#endif
   header = src[i++];
   if (hasTransportCodes()) {
     memcpy(&transport_codes[0], &src[i], 2); i += 2;

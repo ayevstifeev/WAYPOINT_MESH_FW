@@ -924,6 +924,391 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(default_scope.key, 0, sizeof(default_scope.key));
 }
 
+#ifdef WITH_MESH_SLIM
+// ---- the protocol switch (MESH_SLIM) ------------------------------------
+// This repeater carries both protocols and starts on the one it last saved:
+// MeshCore until told otherwise, so a freshly flashed repeater can always be
+// reached, logged into and updated. It is moved by `proto slim|meshcore` on
+// its command line - over USB, or as admin over MeshCore - and back from slim
+// by the base's "!S0 <name>" broadcast. Slim has no logins, so without that
+// broadcast a repeater put on slim could only be brought back by someone
+// standing next to it.
+
+static const char* PROTO_FILE = "/proto";
+//: Quiet on the outbound queue this long before restarting: the reply to
+//: whoever asked, and anything being repeated, go out first.
+static const unsigned long PROTO_RESTART_QUIET_MS = 4000;
+//: Restart by then whatever the queue is doing: a busy channel must not keep
+//: a repeater on a protocol it has already said it is leaving.
+static const unsigned long PROTO_RESTART_MAX_MS = 30000;
+static MyMesh* _slim_self = nullptr;
+
+bool MyMesh::saveSlimProto(bool on) {
+  // Refused rather than allowed-and-broken: slim with no key is a radio on a
+  // sync word nobody else uses, unable to authenticate anything.
+  if (!slimproto::canSwitch() || (on && !slimproto::haveKey())) return false;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  _fs->remove(PROTO_FILE);
+  File f = _fs->open(PROTO_FILE, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File f = _fs->open(PROTO_FILE, "w");
+#else
+  File f = _fs->open(PROTO_FILE, "w", true);
+#endif
+  if (!f) return false;
+  const uint8_t v = on ? 1 : 0;
+  f.write(&v, 1);
+  f.close();
+  _proto_restart_at = futureMillis(PROTO_RESTART_QUIET_MS);
+  _proto_restart_by = futureMillis(PROTO_RESTART_MAX_MS);
+  return true;
+}
+
+void MyMesh::loadSlimProto() {
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(PROTO_FILE, "r");
+#else
+  File f = _fs->open(PROTO_FILE);
+#endif
+  if (!f) return;               // never switched: MeshCore
+  uint8_t v = 0;
+  const bool got = f.read(&v, 1) == 1;
+  f.close();
+  if (got && slimproto::canSwitch() && (v == 0 || slimproto::haveKey())) {
+    slimproto::setActive(v != 0);   // reconfigures the radio if it changed
+  }
+}
+
+//: MRPTnn is unit 15 - nn on slim. Repeaters count down from the base's 15
+//: while trackers (MTRKnn is nn) count up from 1, so the two never share a
+//: number until the net is full. Without it every repeater built from one
+//: file is the build's MESH_SLIM_UNIT, and repeaters sharing a number break
+//: the routes slim learns from who repeated what. Any other name keeps the
+//: build's number.
+void MyMesh::loadSlimUnit() {
+  const char* n = _prefs.node_name;
+  if (toupper((unsigned char)n[0]) != 'M' || toupper((unsigned char)n[1]) != 'R'
+      || toupper((unsigned char)n[2]) != 'P' || toupper((unsigned char)n[3]) != 'T'
+      || !isdigit((unsigned char)n[4]) || !isdigit((unsigned char)n[5]) || n[6] != 0) {
+    return;
+  }
+  const int nn = (n[4] - '0') * 10 + (n[5] - '0');
+  if (nn >= 1 && nn < slim::ADDR_BASE) slimproto::setUnit((uint8_t)(slim::ADDR_BASE - nn));
+}
+
+static bool slimSwitch(bool on) {
+  return _slim_self != nullptr && _slim_self->saveSlimProto(on);
+}
+
+static bool sameName(const char* a, const char* b) {
+  for (; *a && *b; a++, b++) {
+    if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return false;
+  }
+  return *a == *b;
+}
+
+//: "!S0 MRPT01" - or "!S0 *" for every repeater - from the base: back to
+//: MeshCore. A broadcast rather than a message to one unit, because it is
+//: matched by name: a repeater's slim unit number is its build's, not its
+//: callsign's, and the base addresses units by callsign. Unacknowledged; the
+//: base sees it worked when it hears the repeater on MeshCore again.
+//: A health check. The base asks with a PING and the repeater answers
+//: with a STATUS: battery, temperature, uptime, signal and counters, about
+//: eighteen bytes, in one exchange.
+//:
+//: On MeshCore the same reading takes a login, a status request and a
+//: telemetry request, and the login is why a repeater that has rebooted
+//: goes quiet until the base notices and logs in again. There are no
+//: logins here: the operation key authenticated the frame before this was
+//: called, which is the same proof a login was standing in for.
+void MyMesh::sendSlimStatus(uint8_t to, uint16_t wanted, int ttl) {
+  slimhealth::Status st;
+  if (wanted & (1u << slimhealth::F_BATT_MV)) {
+    st.set(slimhealth::F_BATT_MV, board.getBattMilliVolts());
+  }
+  if (wanted & (1u << slimhealth::F_TEMP_C)) {
+    const float t = board.getMCUTemperature();
+    // Left out rather than sent as zero: a repeater with no sensor must
+    // not put a plausible temperature into a record kept for months.
+    if (!isnan(t)) st.set(slimhealth::F_TEMP_C, t);
+  }
+  if (wanted & (1u << slimhealth::F_UPTIME_MIN)) {
+    st.set(slimhealth::F_UPTIME_MIN, (uptime_millis / 1000) / 60);
+  }
+  if (wanted & (1u << slimhealth::F_RSSI)) {
+    st.set(slimhealth::F_RSSI, radio_driver.getLastRSSI());
+  }
+  if (wanted & (1u << slimhealth::F_SNR)) {
+    st.set(slimhealth::F_SNR, radio_driver.getLastSNR());
+  }
+  if (wanted & (1u << slimhealth::F_NOISE)) {
+    st.set(slimhealth::F_NOISE, _radio->getNoiseFloor());
+  }
+  if (wanted & (1u << slimhealth::F_RX)) {
+    st.set(slimhealth::F_RX, radio_driver.getPacketsRecv());
+  }
+  if (wanted & (1u << slimhealth::F_TX)) {
+    st.set(slimhealth::F_TX, radio_driver.getPacketsSent());
+  }
+  if (wanted & (1u << slimhealth::F_AIR_S)) {
+    st.set(slimhealth::F_AIR_S, getTotalAirTime() / 1000);
+  }
+  if (wanted & (1u << slimhealth::F_QUEUE)) {
+    st.set(slimhealth::F_QUEUE, _mgr->getOutboundTotal());
+  }
+  if (wanted & (1u << slimhealth::F_ERRORS)) {
+    st.set(slimhealth::F_ERRORS, _err_flags);
+  }
+  if (wanted & (1u << slimhealth::F_FLAGS)) {
+    uint8_t flags = slimhealth::FLAG_REPEATS;
+    if (slimhealth::batteryPercent(board.getBattMilliVolts()) < 15.0) {
+      flags |= slimhealth::FLAG_LOW;
+    }
+    st.set(slimhealth::F_FLAGS, flags);
+  }
+
+  uint8_t body[slimhealth::MAX_BODY];
+  const int n = slimhealth::encode(st, body, sizeof(body));
+  if (n < 0) return;
+  // -1, not a capped ttl. The router REFUSES a flood at anything but
+  // TTL_INIT (a wrong ttl would teach every listener a wrong distance),
+  // and a repeater that has not yet learned a route back to the base
+  // floods - so a capped answer was rejected by buildOutbound and
+  // silently dropped. That is every reading from a freshly booted
+  // repeater, which is the one on the hilltop. The spread this was
+  // guarding against is handled by the router preferring a DIRECT route
+  // as soon as it knows one.
+  (void)ttl;
+  // Flooded: the answer to a health check has to come back by whatever
+  // path works, not by the one this node happens to have stored.
+  sendSlimFrame(slim::TYPE_STATUS, body, (uint8_t)n, to, -1,
+                /*prefer_direct=*/false);
+}
+
+//: One slim frame onto the air, and the only place this example asks
+//: for a packet.
+//:
+//: Written once because the interesting half is the failure half: the
+//: pool can be empty, and a packet obtained and then not released is a
+//: leak that shows up hours later as a repeater that has stopped
+//: repeating. Two copies of that is one copy that gets fixed.
+//: `prefer_direct` false floods even when a route is known. A probe's
+//: answer must not take a stored route: DIRECT names one carrier, and a
+//: carrier that cannot relay it drops the frame where it stands - so the
+//: asker reports "no reply" when in fact it was heard and answered.
+void MyMesh::sendSlimFrame(uint8_t type, const uint8_t* body,
+                           uint8_t len, uint8_t to, int ttl,
+                           bool prefer_direct) {
+  mesh::Packet* pkt = obtainNewPacket();
+  if (pkt == NULL) return;
+  if (slimproto::buildOutbound(pkt, type, body, len, to, millis(),
+                               ttl, prefer_direct) < 0) {
+    releasePacket(pkt);
+    return;
+  }
+  sendFlood(pkt);
+}
+
+//: Long enough after boot that the radio has settled; then hourly,
+//: which is MeshCore's own advert interval. About 53 bytes an hour.
+//: Long enough for the asker's burst to finish. See _slim_reply_at.
+static const unsigned long SLIM_REPLY_QUIET_MS = 2500;
+
+static const unsigned long SLIM_ADVERT_FIRST_MS = 15000;
+static const unsigned long SLIM_ADVERT_EVERY_MS = 3600000UL;
+
+//: Everything a repeater can say about itself without inventing any of
+//: it. Used when nobody asked, so there is no request to read the
+//: wanted fields out of; sendSlimStatus still leaves out anything the
+//: board cannot actually measure.
+static const uint16_t SLIM_STATUS_ALL =
+  (1u << slimhealth::F_BATT_MV) | (1u << slimhealth::F_TEMP_C)
+  | (1u << slimhealth::F_UPTIME_MIN) | (1u << slimhealth::F_RSSI)
+  | (1u << slimhealth::F_SNR) | (1u << slimhealth::F_NOISE);
+
+//: What this unit is running, for the advert to carry.
+//:
+//: FIRMWARE_VERSION alone does not answer the question people ask. It is a
+//: hardcoded string in a header, so five different builds flashed in one
+//: evening all report "v1.16.0" and the operator cannot tell which is on
+//: the unit in their hand. __DATE__ and __TIME__ are the compiler's own
+//: record of this build and change whenever this file is recompiled, which
+//: is what makes the two together worth putting on the air.
+static const char* SLIM_FW = FIRMWARE_VERSION " " __DATE__ " " __TIME__;
+//: "!V<callsign><64 hex>" - who this repeater is.
+//:
+//: A repeater has no position to report, so before this it was silent
+//: except when relaying - and a base on a slim-only network had no way
+//: to learn it existed, let alone reach its command line.
+void MyMesh::sendSlimAdvert() {
+  if (!slimproto::active()) return;
+  // 64 for the key, the rest for "<name> <version>": a 32-char name and
+  // a compile stamp both fit, and the length guard below refuses rather
+  // than truncating if they ever do not.
+  char text[PUB_KEY_SIZE * 2 + 96];
+  // "<name> <version>": the reader takes the name up to the first space
+  // and the key from the last 64 characters, so the version sits between
+  // them and an advert from a unit too old to carry one still reads.
+  //
+  // MESH_SLIM_ADVERT_NO_VERSION builds the older, version-less form. A
+  // base that predates the space-separated name reads the version as
+  // part of the callsign and writes rubbish into its pairing file, so a
+  // unit flashed ahead of its base needs this until the base catches up.
+#ifdef MESH_SLIM_ADVERT_NO_VERSION
+  const int n = snprintf(text, sizeof(text), "!V%s", _prefs.node_name);
+#else
+  const int n = snprintf(text, sizeof(text), "!V%s %s",
+                         _prefs.node_name, SLIM_FW);
+#endif
+  if (n < 3 || n + PUB_KEY_SIZE * 2 >= (int)sizeof(text)) return;
+  mesh::Utils::toHex(&text[n], self_id.pub_key, PUB_KEY_SIZE);
+  text[n + PUB_KEY_SIZE * 2] = 0;
+
+  uint8_t body[slim::MAX_BODY];
+  const int blen = slimapp::bodyFor(text, body, sizeof(body));
+  if (blen < 0) return;
+  sendSlimFrame(slim::TYPE_GRPTEXT, body, (uint8_t)blen,
+                slim::ADDR_BROADCAST, -1);
+}
+
+//: One line of CLI reply, addressed back to whoever asked.
+//:
+//: `line` must already begin "!A" - handleSlimAdmin reserves the two
+//: bytes rather than copying the whole reply to prepend them, which on
+//: the deepest path in this firmware is 176 bytes of stack and an
+//: snprintf per answer.
+//:
+//: The prefix is on the reply for the same reason it is on the
+//: command: it is what tells the far end this is the command line
+//: rather than chat, which slim has no frame subtype to say. It also
+//: keeps the body on slimapp's seven-bit path, so a reply quoting a
+//: name or a key does not come back shouting.
+//:
+//: noinline deliberately: inlined, its frame buffer stays live across
+//: handleCommand, which is the deepest call in the firmware.
+__attribute__((noinline))
+void MyMesh::sendSlimText(uint8_t to, char* line) {
+  uint8_t body[slim::MAX_BODY];
+  const int n = slimapp::bodyFor(line, body, sizeof(body));
+  if (n < 0) return;
+  // -1 for the same reason sendSlimStatus passes -1: a capped ttl on a
+  // flood is refused by the router and thrown away without a word, and
+  // a repeater answers a command long before it has learned the way
+  // home. This is the reply to "start ota" among everything else.
+  sendSlimFrame(slim::TYPE_TEXT, body, (uint8_t)n, to, -1);
+}
+
+//: "!A<ts-hex> <command>" from the base: this repeater's own command
+//: line, over slim.
+//:
+//: **No commands are defined here.** Everything a repeater can be told
+//: already lives in handleCommand(), which MeshCore admin and the USB
+//: console both call; this is a third caller. A command added here
+//: would work over slim and not over USB, which is how two command
+//: surfaces that disagree with each other get started.
+//:
+//: **Authority is the operation key.** A slim frame is authenticated by
+//: the 128-bit key every unit carries, and onSlimRecv accepts frames
+//: only from unit 15, the base. There is no second password because
+//: there is nothing left for one to defend: anyone who can forge this
+//: can already forge the "!S1" that makes every repeater deaf to
+//: MeshCore, and can forge positions and alerts - which during a search
+//: is worse than a rebooted repeater. A password here would protect the
+//: least valuable thing the key opens.
+//:
+//: **The timestamp is not decoration.** It is what handleCommand() reads
+//: as sender_timestamp, and a zero there is the serial console's own
+//: privilege: `erase`, `get prv.key` and `set freq` all test for it. A
+//: radio admin must not be able to claim that, so a zero is refused
+//: rather than passed through. It must also not go backwards, which is
+//: what stops a recorded frame being replayed - and on the way past it
+//: sets the clock of a repeater that has no GPS and, on slim, no
+//: MeshCore contact to learn the time from.
+void MyMesh::handleSlimAdmin(uint8_t from, char* msg) {
+  char* p = &msg[2];                       // past "!A"
+  while (*p == ' ') p++;
+  char* sp = strchr(p, ' ');
+  if (sp == NULL) return;                  // a timestamp and nothing to run
+  *sp++ = 0;
+  const uint32_t ts = (uint32_t)strtoul(p, NULL, 16);
+  while (*sp == ' ') sp++;
+  if (*sp == 0 || ts == 0 || ts < _slim_admin_ts) return;
+  _slim_admin_ts = ts;
+
+  // The prefix the answer goes out behind, written before the answer
+  // is: handleCommand fills from reply[2] on, and sendSlimText is
+  // handed the whole buffer. Saves copying the reply to prepend two
+  // bytes on the deepest stack path there is.
+  char reply[2 + 160];                     // 160 as main.cpp sizes it
+  reply[0] = '!';
+  reply[1] = 'A';
+  reply[2] = 0;
+  // `reboot` does not return, so its acknowledgement would never be sent
+  // and whoever asked would be left unable to tell a repeater that
+  // restarted from one that has stopped answering. Deferred through the
+  // timer the protocol switch already uses, which waits for the outbound
+  // queue to drain first.
+  if (strcmp(sp, "reboot") == 0) {
+    _proto_restart_at = futureMillis(PROTO_RESTART_QUIET_MS);
+    _proto_restart_by = futureMillis(PROTO_RESTART_MAX_MS);
+    strcpy(&reply[2], "OK - rebooting");
+  } else {
+    handleCommand(ts, sp, &reply[2]);
+  }
+  if (reply[2]) {
+    // Same reason as the ping. StrHelper rather than strcpy so a long
+    // CLI answer is truncated rather than running off the buffer.
+    StrHelper::strncpy(_slim_reply_text, reply, sizeof(_slim_reply_text));
+    _slim_reply_to = from;
+    _slim_reply_want = 0;
+    _slim_reply_at = futureMillis(SLIM_REPLY_QUIET_MS);
+  }
+}
+
+//: A repeater forwards what it hears and reads almost none of it, so the
+//: link stats have nobody to go to. Named and ignored rather than left
+//: unnamed: the next person to want them here should see that they arrive.
+void MyMesh::onSlimRecv(const slim::Frame& f, const slimproto::Link&) {
+  if (f.src != slim::ADDR_BASE) return;         // the base only: unit 15
+  if (f.type == slim::TYPE_PING) {
+    // Owed, not sent: see sendPendingSlimReply. A transmission started
+    // here happens inside the dispatcher's handling of this very
+    // packet and does not reach the air.
+    _slim_reply_to = f.src;
+    _slim_reply_want = slimhealth::wanted(f.body, f.body_len);
+    _slim_reply_text[0] = 0;
+    _slim_reply_at = futureMillis(SLIM_REPLY_QUIET_MS);
+    return;
+  }
+  if (f.type != slim::TYPE_GRPTEXT && f.type != slim::TYPE_TEXT) return;
+  // Addressed only. A broadcast "!Areboot" would take down every
+  // repeater in the net at once, and the replies would collide with
+  // each other on the way back.
+  //
+  // "!A" is what says this is the command line rather than chat. Slim
+  // has no frame subtype to say it with - MeshCore uses
+  // TXT_TYPE_CLI_DATA - so the discriminator has to be in the body.
+  // That it also keeps the text on slimapp's seven-bit path, where
+  // case survives, is the second reason and not the first.
+  // decodeBody rather than slimtext::decode: "!S0 MRPT01" is uppercase so it
+  // rides the text tier today, but a name with a lower-case letter in it
+  // would go as an app datagram, and a repeater that could not read the one
+  // command that brings it home is a repeater someone has to climb to.
+  char msg[slimapp::MAX_TEXT + 24];
+  if (slimapp::decodeBody(f.body, f.body_len, msg, sizeof(msg)) <= 0) return;
+  if (f.type == slim::TYPE_TEXT && msg[0] == '!' && msg[1] == 'A') {
+    handleSlimAdmin(f.src, msg);
+    return;
+  }
+  if (msg[0] != '!' || msg[1] != 'S' || (msg[2] != '0' && msg[2] != '1')) return;
+  const char* who = &msg[3];
+  while (*who == ' ') who++;
+  if (!(strcmp(who, "*") == 0 || sameName(who, _prefs.node_name))) return;
+  const bool on = msg[2] == '1';
+  if (on != slimproto::active()) saveSlimProto(on);
+}
+#endif
+
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
@@ -961,6 +1346,19 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
+#ifdef WITH_MESH_SLIM
+  _slim_self = this;
+  slimproto::setHandler(this);
+  slimproto::setSwitchHandler(slimSwitch);
+  loadSlimUnit();
+  // After setParams, so the saved protocol has the last word on the radio.
+  loadSlimProto();
+  // A command recorded off the air before the last power cut must not
+  // still work after it. Only ever as good as the clock - which is what
+  // MeshCore's own admin replay guard rests on too.
+  _slim_admin_ts = getRTCClock()->getCurrentTime();
+  _slim_advert_at = futureMillis(SLIM_ADVERT_FIRST_MS);
+#endif
 
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
@@ -1262,7 +1660,60 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   }
 }
 
+#ifdef WITH_MESH_SLIM
+//: The answer owed from the last frame, now that the receive path has
+//: finished with it. One pending reply: a repeater is asked by one base,
+//: and a second request arriving before the first answer went out is a
+//: retry, so the newer one is the one worth answering.
+void MyMesh::sendPendingSlimReply() {
+  const uint8_t to = _slim_reply_to;
+  if (!to || !slimproto::active()) return;
+  if (_slim_reply_at && !millisHasNowPassed(_slim_reply_at)) return;
+  _slim_reply_to = 0;                       // owed once, whatever happens
+  if (_slim_reply_text[0]) {
+    sendSlimText(to, _slim_reply_text);
+    _slim_reply_text[0] = 0;
+  } else {
+    sendSlimStatus(to, _slim_reply_want, -1);
+  }
+}
+#endif  // WITH_MESH_SLIM
+
 void MyMesh::loop() {
+#ifdef WITH_MESH_SLIM
+  // First, because an answer somebody is waiting on should not queue
+  // behind this node's own housekeeping.
+  sendPendingSlimReply();
+  // Who this repeater is, to a base that has not heard of it.
+  if (_slim_advert_at && millisHasNowPassed(_slim_advert_at)
+      && slimproto::active()) {
+    sendSlimAdvert();
+    _slim_advert_at = futureMillis(SLIM_ADVERT_EVERY_MS);
+    // ...and how it is, ten seconds later. Broadcast, because a broadcast
+    // from this node is the one thing shown to arrive - a request-and-reply
+    // battery reading needs the base to reach the repeater, and a repeater
+    // nobody can read the battery of is what the health log exists to
+    // prevent. NOT back to back with the advert: sent together, the second
+    // frame contends with the first one's airtime and is usually lost.
+    _slim_status_at = futureMillis(10000);
+  }
+  if (_slim_status_at && millisHasNowPassed(_slim_status_at)
+      && slimproto::active()) {
+    _slim_status_at = 0;
+    sendSlimStatus(slim::ADDR_BROADCAST, SLIM_STATUS_ALL, -1);
+  }
+  // Moved to the other protocol: restart once the reply and anything being
+  // repeated are on the air.
+  if (_proto_restart_at) {
+    if (_mgr->getOutboundTotal() > 0) {
+      _proto_restart_at = futureMillis(PROTO_RESTART_QUIET_MS);
+    }
+    if (millisHasNowPassed(_proto_restart_at)
+        || millisHasNowPassed(_proto_restart_by)) {
+      board.reboot();   // doesn't return
+    }
+  }
+#endif
 #ifdef WITH_BRIDGE
   bridge.loop();
 #endif

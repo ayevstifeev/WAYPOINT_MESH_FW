@@ -1,6 +1,10 @@
 #include "Mesh.h"
 //#include <Arduino.h>
 
+#ifdef WITH_MESH_SLIM
+  #include <helpers/slim/SlimProto.h>
+#endif
+
 namespace mesh {
 
 void Mesh::begin() {
@@ -39,6 +43,23 @@ int Mesh::searchChannelsByHash(const uint8_t* hash, GroupChannel channels[], int
 }
 
 DispatcherAction Mesh::onRecvPacket(Packet* pkt) {
+#ifdef WITH_MESH_SLIM
+  // Everything below this point is MeshCore's routing: accumulated paths,
+  // source routing, per-contact keys. MESH_SLIM routes from a per-node table
+  // instead, so it takes the whole decision rather than sharing it. Note it
+  // also bypasses _tables->hasSeen() on purpose: MeshCore deduplicates on a
+  // hash of the payload, which changes at every hop once ttl and HOP are
+  // rewritten, so it would not catch a re-flood. The slim router deduplicates
+  // on (SRC, SEQ), which does.
+  if (slimproto::active()) {
+    // getRetransmitDelay() is the same jitter MeshCore already applies, from
+    // the same seeded RNG, and it stays overridable per example. Rolling a
+    // separate one here meant a second getEstAirtimeFor() - an SPI round trip -
+    // on every packet, discarded entirely on a node that does not forward.
+    return slimproto::onRecvPacket(pkt, _ms->getMillis(),
+                                   getRetransmitDelay(pkt));
+  }
+#endif
   if (pkt->isRouteDirect() && pkt->getPayloadType() == PAYLOAD_TYPE_TRACE) {
     if (pkt->path_len < MAX_PATH_SIZE) {
       uint8_t i = 0;

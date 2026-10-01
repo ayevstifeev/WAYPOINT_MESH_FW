@@ -24,11 +24,34 @@ void setFlag(void) {
   state |= STATE_INT_READY;
 }
 
+#ifdef WITH_MESH_SLIM
+#include <helpers/slim/SlimProto.h>
+
+// There is exactly one radio, so a file-static pointer is enough to give
+// SlimProto a way back to it. Doing the wiring here rather than in each
+// example's main.cpp means no application has to know the slim protocol
+// exists in order for the switch to reach the hardware.
+static RadioLibWrapper* _slim_radio = nullptr;
+static void slimRadioConfig(bool on) {
+  if (_slim_radio) _slim_radio->setProtocolMode(on);
+}
+#endif
+
 void RadioLibWrapper::begin() {
   _radio->setPacketReceivedAction(setFlag);  // this is also SentComplete interrupt
   _preamble_sf = getSpreadingFactor();
   _radio->setPreambleLength(preambleLengthForSF(_preamble_sf)); // longer preamble for lower SF improves reliability
   state = STATE_IDLE;
+
+#ifdef WITH_MESH_SLIM
+  _slim_radio = this;
+  slimproto::setRadioConfigurator(slimRadioConfig);
+  slimproto::begin();   // build-flag identity: unit, key, forwards, burst
+  // A dual build can boot into either protocol, and the preamble was just set
+  // to the MeshCore value above. Apply the slim settings if that is where we
+  // are, or the radio listens on the wrong sync word until someone switches it.
+  if (slimproto::active()) setProtocolMode(true);
+#endif
 
   if (_board->getStartupReason() == BD_STARTUP_RX_PACKET) {  // received a LoRa packet (while in deep sleep)
     setFlag(); // LoRa packet is already received
@@ -54,6 +77,13 @@ void RadioLibWrapper::idle() {
   _radio->standby();
   state = STATE_IDLE;   // need another startReceive()
 }
+
+#ifdef WITH_TRACKER_MODE
+void RadioLibWrapper::sleepWarm() {
+  _radio->sleep();      // warm: configuration retained
+  state = STATE_IDLE;   // the next recvRaw() calls startReceive()
+}
+#endif
 
 void RadioLibWrapper::triggerNoiseFloorCalibrate(int threshold) {
   _threshold = threshold;

@@ -13,13 +13,35 @@
 
 #include "NodePrefs.h"
 
+//: The screens that let somebody answer and mark ground, and the MyMesh
+//: methods they call.
+//:
+//: One name because the two halves were guarded on different
+//: predicates - the screens on slim-and-a-joystick, placeMarker() and
+//: hereNow() on tracker mode - and every current build happens to set
+//: both. That is the same shape as the guard mismatch that stopped
+//: SLIM_RAK_4631_base compiling: it breaks on the first variant that
+//: does not, not on the one in front of you.
+#if defined(WITH_MESH_SLIM) && defined(WITH_TRACKER_MODE) \
+    && defined(UI_HAS_JOYSTICK) && UI_HAS_JOYSTICK
+  #define WITH_SLIM_UI 1
+#endif
+
 enum class UIEventType {
     none,
     contactMessage,
     channelMessage,
     roomMessage,
     newContactMessage,
-    ack
+    ack,
+    //: A tracker report the base acknowledged, and a tracker that has
+    //: stopped getting through. Their own events rather than reusing
+    //: `ack`, because they are the answer to a different question: not
+    //: "did my message arrive", asked by somebody holding the unit and
+    //: looking at it, but "are we still in contact", asked by somebody
+    //: walking with it in a pack who will never look at it at all.
+    trackerHeard,
+    trackerLost
 };
 
 class AbstractUITask {

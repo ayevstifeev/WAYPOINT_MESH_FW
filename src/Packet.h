@@ -49,6 +49,19 @@ public:
   uint8_t path[MAX_PATH_SIZE];
   uint8_t payload[MAX_PACKET_PAYLOAD];
   int8_t _snr;
+#ifdef WITH_MESH_SLIM
+  //: dBm, captured WITH the packet rather than read back from the radio
+  //: when the packet is handled.
+  //:
+  //: A flood whose score is below the threshold is parked in the inbound
+  //: queue for up to MAX_RX_DELAY_MILLIS before anything looks at it - and
+  //: slim positions are floods, so they are exactly the packets that wait.
+  //: By then the radio's "last RSSI" belongs to whatever arrived next: a
+  //: plausible number attached to the wrong transmission, which is worse
+  //: than no number at all. Guarded, so a stock build is byte for byte what
+  //: it was.
+  int16_t _rssi;
+#endif
 
   /**
    * \brief calculate the hash of payload + type
