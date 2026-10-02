@@ -222,6 +222,16 @@ public:
   void oweSlimReply(uint8_t to, uint8_t type, uint8_t seq, uint16_t want);
   //: Whatever has come due, one per pass. Called from loop().
   void sendOwedSlimReplies();
+  //: True while a reply has been promised and not yet sent.
+  //:
+  //: **A tracker must not go quiet owing somebody an answer.** The reply is
+  //: deliberately held back past the asker's burst, and for those seconds it
+  //: is in no queue at all - so the sleep test, which asks whether anything
+  //: is queued, said yes-sleep and the promise was broken in silence. The
+  //: base then retried a command the unit had already carried out, five
+  //: times, and recorded it as undelivered. Seen 2026-10-02: "!T180" put
+  //: MTRK01 into tracker mode and the base gave up on it.
+  bool owedSlimReply() const;
 
   //: Queue one slim frame `txBurst()` times. Identical copies: the mesh
   //: deduplicates on (SRC, SEQ), so every receiver after the first drops them

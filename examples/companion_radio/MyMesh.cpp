@@ -746,6 +746,13 @@ void MyMesh::oweSlimReply(uint8_t to, uint8_t type, uint8_t seq,
   // this exists to avoid, and the asker retries.
 }
 
+bool MyMesh::owedSlimReply() const {
+  for (uint8_t i = 0; i < SLIM_OWED_MAX; i++) {
+    if (_owed[i].to) return true;
+  }
+  return false;
+}
+
 void MyMesh::sendOwedSlimReplies() {
   if (!slimproto::active()) return;
   for (uint8_t i = 0; i < SLIM_OWED_MAX; i++) {
@@ -4107,13 +4114,30 @@ bool MyMesh::trackerLoop() {
   // in LISTEN for ten seconds afterwards. A ping is sent by hand, from
   // whatever phase the unit happens to be in.
   bool testing = false;
+  bool owing = false;
 #ifdef WITH_MESH_SLIM
   // A range test and a message from the screen are both waiting on an
   // answer that has nothing queued behind it, so both have to keep the
   // receiver on. See linkTestOpen and MyMesh::Outgoing.
   testing = linkTestOpen() || textAckOpen();
+  // ...and so does an answer this unit has promised somebody else.
+  //
+  // **The same fault from the other side.** The three above are this unit
+  // waiting for a reply; this is this unit owing one. An owed reply is held
+  // back past the asker's burst on purpose, and for those seconds it sits in
+  // _owed and in no queue, so `getOutboundTotal() == 0` was true and the
+  // schedule was free to park the radio with the promise unkept.
+  //
+  // What that looked like on 2026-10-02: the base sent "!T180", MTRK01
+  // obeyed it and entered tracker mode, the acknowledgement was owed 2.5
+  // seconds later, and the base retried five times and logged "gave up on a
+  // message to unit 1". A unit correctly configured and a base recording the
+  // opposite is the worst of the three states to be in, because the operator
+  // re-sends a setting that was never wrong.
+  owing = owedSlimReply();
 #endif
-  const bool quiet = _mgr->getOutboundTotal() == 0 && !acking && !testing;
+  const bool quiet = _mgr->getOutboundTotal() == 0 && !acking && !testing
+                     && !owing;
   const bool have_fix = _fixes >= tracker::FIX_SETTLE;
   const tracker::Schedule::Action act = _tracker.tick(now, have_fix, quiet);
   if (act == tracker::Schedule::SAMPLE) {
