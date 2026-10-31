@@ -110,6 +110,11 @@ int encodeMarker(char* out, uint8_t cap, uint8_t role, uint8_t number,
 // A point is 42 bits: lat 14, lon 14, age 14 - how long before the message
 // was sent, in four-second steps. Ages rather than times, so a unit whose
 // clock was never set still dates its track correctly.
+//
+// A unit that does know the time says when it sent the message: seq gains
+// HIST_TIMED and the first record is that time, in Unix seconds. Ages count
+// back from there rather than from whenever a relayed copy arrived, so the
+// base dates a place the same way however it came. history.py has the story.
 
 static const uint8_t  HIST_HEADER_CHARS = 8;
 static const uint8_t  HIST_RECORD_CHARS = 7;
@@ -120,6 +125,13 @@ static const uint8_t  HIST_MAX_TEXT     = 140;
 //: Points one message can carry: (140 - 8) / 7.
 static const uint8_t  HIST_MAX_POINTS   =
     (HIST_MAX_TEXT - HIST_HEADER_CHARS) / HIST_RECORD_CHARS;
+
+//: Added to seq when the first record is the time the message was sent.
+static const uint8_t  HIST_TIMED        = 32;
+//: Points in one piece on slim. A full message is 108 bytes and 6.7 s at
+//: SF12, and on 2026-10-31 those were lost while reports got through. Eight
+//: with the time is 61 bytes and 4.1 s.
+static const uint8_t  HIST_SLIM_POINTS  = 8;
 
 struct HistPoint { double lat, lon; uint32_t age_s; };
 
@@ -132,6 +144,11 @@ struct HistPoint { double lat, lon; uint32_t age_s; };
 //: Every message is whole in itself - sequence 0 of 1 - because a unit sends
 //: them one at a time, each only after the last was acknowledged, and cannot
 //: know how many there will be. The base uses the pair only to log progress.
-uint8_t encodeHistory(char* out, const HistPoint* pts, uint8_t n);
+//:
+//: `sent_s` is the time now in Unix seconds, 0 if this unit does not know it.
+//: `max_points` caps the piece below what fits.
+uint8_t encodeHistory(char* out, const HistPoint* pts, uint8_t n,
+                      uint32_t sent_s = 0,
+                      uint8_t max_points = HIST_MAX_POINTS);
 
 }  // namespace slimcodec

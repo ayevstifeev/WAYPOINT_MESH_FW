@@ -1096,26 +1096,54 @@ void MyMesh::sendSlimStatus(uint8_t to, uint16_t wanted, int ttl) {
 //: answer must not take a stored route: DIRECT names one carrier, and a
 //: carrier that cannot relay it drops the frame where it stands - so the
 //: asker reports "no reply" when in fact it was heard and answered.
-void MyMesh::sendSlimFrame(uint8_t type, const uint8_t* body,
-                           uint8_t len, uint8_t to, int ttl,
-                           bool prefer_direct) {
+uint8_t MyMesh::sendSlimFrame(uint8_t type, const uint8_t* body,
+                              uint8_t len, uint8_t to, int ttl,
+                              bool prefer_direct, uint8_t copies) {
   mesh::Packet* pkt = obtainNewPacket();
-  if (pkt == NULL) return;
-  if (slimproto::buildOutbound(pkt, type, body, len, to, millis(),
-                               ttl, prefer_direct) < 0) {
+  if (pkt == NULL) return 0;
+  const int n = slimproto::buildOutbound(pkt, type, body, len, to, millis(),
+                                         ttl, prefer_direct);
+  if (n < 0) {
     releasePacket(pkt);
-    return;
+    return 0;
+  }
+  // Identical copies, as the companion's sendSlimBurst: same SEQ and tag, so
+  // every receiver after the first one drops them for nothing.
+  for (uint8_t c = 1; c < copies; c++) {
+    mesh::Packet* dup = obtainNewPacket();
+    if (dup == NULL) break;          // pool exhausted: send what we have
+    memcpy(dup->payload, pkt->payload, pkt->payload_len);
+    dup->payload_len = pkt->payload_len;
+    dup->header = pkt->header;
+    dup->path_len = 0;
+    sendPacket(dup, 1, 0);
   }
   sendFlood(pkt);
+  return (uint8_t)n;
 }
 
-//: Long enough after boot that the radio has settled; then hourly,
-//: which is MeshCore's own advert interval. About 53 bytes an hour.
-//: Long enough for the asker's burst to finish. See _slim_reply_at.
-static const unsigned long SLIM_REPLY_QUIET_MS = 2500;
-
+//: Long enough after boot that the radio has settled.
 static const unsigned long SLIM_ADVERT_FIRST_MS = 15000;
-static const unsigned long SLIM_ADVERT_EVERY_MS = 3600000UL;
+//: **At boot, five adverts five minutes apart**, acknowledged or not. A
+//: repeater is switched on at the top of a hill by somebody who then walks
+//: away, and the base that has to learn it may be off, out of range or still
+//: in the truck for the first of them; a second base may need it too. Twenty
+//: minutes of one advert every five covers the install, for about thirty
+//: seconds of airtime once (2026-10-28). The `advert` command starts a round
+//: as well.
+static const uint8_t SLIM_ADVERT_ROUND = 5;
+static const unsigned long SLIM_ADVERT_ROUND_GAP_MS = 5UL * 60000UL;
+//: **After that, a repeater speaks when it is asked.** The base checks every
+//: repeater it knows every two hours (repeater_health.CHECK_EVERY_S, the
+//: tablet's RPT_EVERY_S), and that check is the only thing a base needs
+//: once it has this repeater's advert. An hourly advert said the same thing
+//: again, six seconds on the air at SF12 plus the status after it, and every
+//: other repeater relayed it (2026-10-28: about half of MRPT01's airtime on
+//: a quiet night). So it advertises again only after this long with no base
+//: asking - three missed checks - which is a base that has lost it, or a new
+//: one that never heard it.
+static const unsigned long SLIM_ADVERT_UNASKED_MS = 6UL * 3600000UL;
+
 
 //: Everything a repeater can say about itself without inventing any of
 //: it. Used when nobody asked, so there is no request to read the
@@ -1140,8 +1168,8 @@ static const char* SLIM_FW = FIRMWARE_VERSION " " __DATE__ " " __TIME__;
 //: A repeater has no position to report, so before this it was silent
 //: except when relaying - and a base on a slim-only network had no way
 //: to learn it existed, let alone reach its command line.
-void MyMesh::sendSlimAdvert() {
-  if (!slimproto::active()) return;
+uint8_t MyMesh::sendSlimAdvert() {
+  if (!slimproto::active()) return 0;
   // 64 for the key, the rest for "<name> <version>": a 32-char name and
   // a compile stamp both fit, and the length guard below refuses rather
   // than truncating if they ever do not.
@@ -1160,15 +1188,23 @@ void MyMesh::sendSlimAdvert() {
   const int n = snprintf(text, sizeof(text), "!V%s %s",
                          _prefs.node_name, SLIM_FW);
 #endif
-  if (n < 3 || n + PUB_KEY_SIZE * 2 >= (int)sizeof(text)) return;
+  if (n < 3 || n + PUB_KEY_SIZE * 2 >= (int)sizeof(text)) return 0;
   mesh::Utils::toHex(&text[n], self_id.pub_key, PUB_KEY_SIZE);
   text[n + PUB_KEY_SIZE * 2] = 0;
 
   uint8_t body[slim::MAX_BODY];
   const int blen = slimapp::bodyFor(text, body, sizeof(body));
-  if (blen < 0) return;
-  sendSlimFrame(slim::TYPE_GRPTEXT, body, (uint8_t)blen,
-                slim::ADDR_BROADCAST, -1);
+  if (blen < 0) return 0;
+  // As many copies as every other frame (MESH_SLIM_BURST). At ~96 bytes this
+  // is the longest frame a repeater sends, and a base that never files the
+  // repeater throws away every reading and ping answer it sends after - so
+  // it is also the one frame a repeater repeats at boot: see
+  // SLIM_ADVERT_ROUND. Sent once with no retry, it was lost over a
+  // reflected path every time while the short frames got through
+  // (2026-10-23, MRPT01 to the Pi).
+  return sendSlimFrame(slim::TYPE_GRPTEXT, body, (uint8_t)blen,
+                       slim::ADDR_BROADCAST, -1, /*prefer_direct=*/true,
+                       slimproto::txBurst());
 }
 
 //: One line of CLI reply, addressed back to whoever asked.
@@ -1224,7 +1260,7 @@ void MyMesh::sendSlimText(uint8_t to, char* line) {
 //: what stops a recorded frame being replayed - and on the way past it
 //: sets the clock of a repeater that has no GPS and, on slim, no
 //: MeshCore contact to learn the time from.
-void MyMesh::handleSlimAdmin(uint8_t from, char* msg) {
+void MyMesh::handleSlimAdmin(uint8_t from, char* msg, uint32_t quiet_ms) {
   char* p = &msg[2];                       // past "!A"
   while (*p == ' ') p++;
   char* sp = strchr(p, ' ');
@@ -1261,15 +1297,31 @@ void MyMesh::handleSlimAdmin(uint8_t from, char* msg) {
     StrHelper::strncpy(_slim_reply_text, reply, sizeof(_slim_reply_text));
     _slim_reply_to = from;
     _slim_reply_want = 0;
-    _slim_reply_at = futureMillis(SLIM_REPLY_QUIET_MS);
+    _slim_reply_at = futureMillis(quiet_ms);
   }
 }
 
 //: A repeater forwards what it hears and reads almost none of it, so the
 //: link stats have nobody to go to. Named and ignored rather than left
 //: unnamed: the next person to want them here should see that they arrive.
-void MyMesh::onSlimRecv(const slim::Frame& f, const slimproto::Link&) {
+void MyMesh::onSlimRecv(const slim::Frame& f, const slimproto::Link& link) {
   if (f.src != slim::ADDR_BASE) return;         // the base only: unit 15
+  // After the rest of the base's burst, worked out from this frame's own
+  // airtime. See slimproto::replyQuietMs.
+  const uint32_t quiet = slimproto::replyQuietMs(
+      _radio->getEstAirtimeFor(link.len));
+  if (f.type == slim::TYPE_ACK) {
+    // The base has this repeater's advert, so it knows who is reporting:
+    // say how this node is, once per round - after the base's second copy
+    // of the ack (MESH_MULTI_ACKS), which follows this one. The round itself
+    // goes on: see SLIM_ADVERT_ROUND.
+    if (_slim_status_owed && f.body_len && f.body[0] == _slim_advert_seq) {
+      _slim_status_owed = false;
+      _slim_status_at = futureMillis(_radio->getEstAirtimeFor(link.len)
+                                     + slimproto::REPLY_QUIET_MIN_MS);
+    }
+    return;
+  }
   if (f.type == slim::TYPE_PING) {
     // Owed, not sent: see sendPendingSlimReply. A transmission started
     // here happens inside the dispatcher's handling of this very
@@ -1277,7 +1329,13 @@ void MyMesh::onSlimRecv(const slim::Frame& f, const slimproto::Link&) {
     _slim_reply_to = f.src;
     _slim_reply_want = slimhealth::wanted(f.body, f.body_len);
     _slim_reply_text[0] = 0;
-    _slim_reply_at = futureMillis(SLIM_REPLY_QUIET_MS);
+    _slim_reply_at = futureMillis(quiet);
+    // A base checking on this repeater already has its advert: the next one
+    // waits until checks stop - see SLIM_ADVERT_UNASKED_MS. Not during the
+    // boot round, which runs its course: see SLIM_ADVERT_ROUND.
+    if (!_slim_advert_left) {
+      _slim_advert_at = futureMillis(SLIM_ADVERT_UNASKED_MS);
+    }
     return;
   }
   if (f.type != slim::TYPE_GRPTEXT && f.type != slim::TYPE_TEXT) return;
@@ -1297,7 +1355,7 @@ void MyMesh::onSlimRecv(const slim::Frame& f, const slimproto::Link&) {
   char msg[slimapp::MAX_TEXT + 24];
   if (slimapp::decodeBody(f.body, f.body_len, msg, sizeof(msg)) <= 0) return;
   if (f.type == slim::TYPE_TEXT && msg[0] == '!' && msg[1] == 'A') {
-    handleSlimAdmin(f.src, msg);
+    handleSlimAdmin(f.src, msg, quiet);
     return;
   }
   if (msg[0] != '!' || msg[1] != 'S' || (msg[2] != '0' && msg[2] != '1')) return;
@@ -1358,6 +1416,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // MeshCore's own admin replay guard rests on too.
   _slim_admin_ts = getRTCClock()->getCurrentTime();
   _slim_advert_at = futureMillis(SLIM_ADVERT_FIRST_MS);
+  _slim_advert_left = SLIM_ADVERT_ROUND;
 #endif
 
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
@@ -1409,6 +1468,22 @@ bool MyMesh::formatFileSystem() {
 }
 
 void MyMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
+#ifdef WITH_MESH_SLIM
+  // **On slim a MeshCore advert is not an advert.** It goes out as 115
+  // bytes no slim receiver can read - five seconds of air at SF12 - and
+  // the boot one is queued a second behind the slim one, so the two
+  // clashed and the slim advert arrived as a header error every time.
+  // Seen 2026-10-23 on the Pi: MRPT01 reset four times, relaying fine,
+  // and never once filed as a contact, so every reading and every ping
+  // answer it sent was thrown away. Asked for one - at boot, or by the
+  // `advert` command - it gets one in the form the network reads, as the
+  // companion answers CMD_SEND_SELF_ADVERT.
+  if (slimproto::active()) {
+    _slim_advert_at = futureMillis(delay_millis > 0 ? delay_millis : 1);
+    _slim_advert_left = SLIM_ADVERT_ROUND;   // a fresh round
+    return;
+  }
+#endif
   mesh::Packet *pkt = createSelfAdvert();
   if (pkt) {
     if (flood) {
@@ -1687,15 +1762,19 @@ void MyMesh::loop() {
   // Who this repeater is, to a base that has not heard of it.
   if (_slim_advert_at && millisHasNowPassed(_slim_advert_at)
       && slimproto::active()) {
+    // Taken before the send, because the base's acknowledgement names it.
+    _slim_advert_seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
     sendSlimAdvert();
-    _slim_advert_at = futureMillis(SLIM_ADVERT_EVERY_MS);
-    // ...and how it is, ten seconds later. Broadcast, because a broadcast
-    // from this node is the one thing shown to arrive - a request-and-reply
-    // battery reading needs the base to reach the repeater, and a repeater
-    // nobody can read the battery of is what the health log exists to
-    // prevent. NOT back to back with the advert: sent together, the second
-    // frame contends with the first one's airtime and is usually lost.
-    _slim_status_at = futureMillis(10000);
+    // The first of a round, or one on its own because no base has asked
+    // for six hours: the next acknowledgement is answered with this node's
+    // health reading (see the ACK in onSlimRecv) - after the exchange, so it
+    // does not land on the base's answer.
+    if (_slim_advert_left == SLIM_ADVERT_ROUND || _slim_advert_left == 0) {
+      _slim_status_owed = true;
+    }
+    if (_slim_advert_left) _slim_advert_left--;
+    _slim_advert_at = futureMillis(_slim_advert_left ? SLIM_ADVERT_ROUND_GAP_MS
+                                                     : SLIM_ADVERT_UNASKED_MS);
   }
   if (_slim_status_at && millisHasNowPassed(_slim_status_at)
       && slimproto::active()) {
@@ -1720,6 +1799,15 @@ void MyMesh::loop() {
 
   mesh::Mesh::loop();
 
+  // MeshCore's own advert timers - a local one every two minutes on a new
+  // install - are MeshCore's. On slim they would put the same unreadable
+  // five seconds on the air every two minutes, over whatever the trackers
+  // were saying; slim adverts hourly on its own timer above.
+#ifdef WITH_MESH_SLIM
+  if (slimproto::active()) {
+    // Nothing: see above.
+  } else
+#endif
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
     uint32_t delay_millis = 0;

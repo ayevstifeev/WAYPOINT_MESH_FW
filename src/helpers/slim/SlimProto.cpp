@@ -90,6 +90,7 @@ void begin() {
 
 void setRadioConfigurator(RadioConfigFn fn) { _radio_cfg = fn; }
 const Counts& counts() { return _counts; }
+void noteBlocked() { _counts.blocked++; }
 void setSwitchHandler(SwitchFn fn) { _switch_fn = fn; }
 void setHandler(Handler* h) { _handler = h; }
 slim::Router& router() { return _router; }
@@ -124,6 +125,40 @@ bool forwards() { return _forwards; }
 
 bool    setTxBurst(uint8_t n) { return _router.setTxBurst(n); }
 uint8_t txBurst() { return _router.txBurst(); }
+
+uint32_t replyQuietMs(uint32_t airtime_ms) {
+  const uint8_t copies = txBurst();
+  const uint32_t rest = (copies > 1 ? copies - 1 : 0)
+                        * (airtime_ms + REPLY_COPY_GAP_MS) + REPLY_MARGIN_MS;
+  return rest > REPLY_QUIET_MIN_MS ? rest : REPLY_QUIET_MIN_MS;
+}
+
+uint32_t peerQuietMs(uint32_t airtime_ms) {
+  const uint32_t own = replyQuietMs(airtime_ms);
+  return own > PEER_QUIET_MAX_MS ? own : PEER_QUIET_MAX_MS;
+}
+
+uint32_t ackWaitMs(uint32_t airtime_ms) {
+  // Copy one heard, the answer held by whoever answers - the slowest still
+  // in the field, not this unit - and the answer itself (an ack is the
+  // shortest frame there is, so no longer than this one)...
+  const uint32_t exchange = airtime_ms + peerQuietMs(airtime_ms) + airtime_ms;
+  // ...and a repeater on the way, each way: its hold before relaying, the
+  // relay itself, and its turnaround.
+  const uint32_t relay = airtime_ms * RELAY_HOLD_AIRTIMES_X2 / 2 + airtime_ms
+                         + REPLY_MARGIN_MS;
+  const uint32_t wait = exchange + 2 * relay;
+  return wait > ACK_WAIT_MIN_MS ? wait : ACK_WAIT_MIN_MS;
+}
+
+uint32_t fastWaitMs(uint32_t airtime_ms) {
+  // The answer straight back: the frame, the answerer's hold, the answer...
+  const uint32_t direct = airtime_ms + peerQuietMs(airtime_ms) + airtime_ms;
+  // ...or a repeater's copy of the frame: its longest hold, then the copy.
+  const uint32_t carried = airtime_ms + airtime_ms * RELAY_HOLD_AIRTIMES_X2 / 2
+                           + airtime_ms;
+  return (direct > carried ? direct : carried) + REPLY_MARGIN_MS;
+}
 
 // ---- the unit map -------------------------------------------------------
 
@@ -210,7 +245,16 @@ mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt, uint32_t now_ms,
   // reply and no log of its contents: what a receiver says about a bad packet
   // is a channel of its own.
   if (r.err != slim::OK) { _counts.bad++; return ACTION_RELEASE; }
-  if (r.duplicate) { _counts.dup++; return ACTION_RELEASE; }
+  if (r.duplicate) {
+    _counts.dup++;
+    // Our own frame, carried back by a repeater: see Handler::onSlimEcho.
+    // The router files our own frames as seen when it sends them, so this is
+    // the only place the echo is visible at all.
+    if (_handler && r.fields.src == _unit && r.fields.hop != r.fields.src) {
+      _handler->onSlimEcho(r.fields);
+    }
+    return ACTION_RELEASE;
+  }
 
   if (r.deliver) _counts.delivered++;
   if (r.onward_len) _counts.forwarded++;
@@ -222,6 +266,7 @@ mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt, uint32_t now_ms,
 #else
     link.rssi = 0;
 #endif
+    link.len = len;
     _handler->onSlimRecv(r.fields, link);
   }
 
@@ -286,6 +331,12 @@ void cli(const char* args, char* reply, uint32_t now_ms) {
             (unsigned long)_counts.sent, (unsigned long)_counts.refused,
             (unsigned long)_counts.seen, (unsigned long)_counts.bad,
             (unsigned long)_counts.dup, (unsigned long)_counts.delivered);
+    // Only when it has happened: a non-zero count is a bug to chase, and the
+    // line every other unit prints stays as it was.
+    if (_counts.blocked) {
+      sprintf(reply + strlen(reply), " meshcore_blocked=%lu",
+              (unsigned long)_counts.blocked);
+    }
     return;
   }
 

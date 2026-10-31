@@ -61,6 +61,18 @@ static const int16_t HOP_COST_DB = 4;
 //: a hop: enough that a real difference still wins promptly.
 static const int16_t ROUTE_HYST_DB = 3;
 
+//: How fast a route that has stopped being heard loses its place, in dB a
+//: minute - one hop's worth.
+//:
+//: A route keeps the reading it was last heard at, so one through a repeater
+//: that has flown on, or past a ridge a team has walked behind, went on
+//: winning on that old reading: a fresh path had to beat it by the hysteresis
+//: for up to the whole fifteen-minute TTL, and everything addressed went down
+//: a path that no longer existed. Aged, a fresh path takes over after a
+//: missed report or two. A route heard again is not aged at all: the age
+//: is the age of the last frame that came that way.
+static const int16_t ROUTE_AGE_DB_PER_MIN = 4;
+
 //: The weakest route worth naming a single carrier on, in dB.
 //:
 //: **A DIRECT frame names one node and nobody else may repeat it.** That is

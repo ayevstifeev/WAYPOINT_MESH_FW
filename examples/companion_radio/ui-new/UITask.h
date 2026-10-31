@@ -75,6 +75,7 @@ class UITask : public AbstractUITask {
   UIScreen* marker_menu;
   TrackerScreen* every_menu;
   UIScreen* link_test;
+  UIScreen* settings_menu;
   ComposeScreen* compose;
 #endif
 
@@ -115,6 +116,9 @@ public:
   //: The range test. Not on the carousel - five presses on the info
   //: page, because it is an engineer's screen, not an operator's.
   void gotoLinkTest();
+  //: Everything off the side-scroll, as a list; and the page a row opens.
+  void gotoSettings();
+  void gotoHomePage(uint8_t page);
   //: Open the composer: a label for a marker of that icon, or
   //: ComposeScreen::NO_ICON for an ordinary message.
   void composeFor(uint8_t icon);

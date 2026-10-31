@@ -83,6 +83,12 @@ void RadioLibWrapper::sleepWarm() {
   _radio->sleep();      // warm: configuration retained
   state = STATE_IDLE;   // the next recvRaw() calls startReceive()
 }
+
+bool RadioLibWrapper::packetWaiting() const {
+  // Set by the interrupt. With nothing being sent - a parked radio has
+  // nothing queued - it can only mean a packet received.
+  return (state & STATE_INT_READY) != 0;
+}
 #endif
 
 void RadioLibWrapper::triggerNoiseFloorCalibrate(int threshold) {

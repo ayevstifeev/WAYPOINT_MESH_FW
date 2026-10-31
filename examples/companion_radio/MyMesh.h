@@ -138,9 +138,17 @@ public:
   //: radio can tell which protocol carried it.
   void onSlimRecv(const slim::Frame& f,
                   const slimproto::Link& link) override;
-  //: Answer a health check: what this node can measure of itself.
+  //: One of this unit's own frames, carried back by a repeater: the message
+  //: on the retry ladder got out, so its answer is worth the full wait.
+  void onSlimEcho(const slim::Frame& f) override;
+  //: ...the frame itself; onSlimRecv adds what is owed to its sender.
+  void handleSlimFrame(const slim::Frame& f, const slimproto::Link& link);
+  //: Answer a health check: what this node can measure of itself. `heard`
+  //: is the request's own reception, for the signal fields; NULL reports
+  //: whatever this radio heard last, which is all a volunteered status has.
   void sendSlimStatus(uint8_t to, uint16_t want, int ttl = -1,
-                      bool prefer_direct = true);
+                      bool prefer_direct = true,
+                      const slimproto::Link* heard = NULL);
 
   //: Say who this unit is: callsign and public key, to everyone.
   //:
@@ -148,7 +156,8 @@ public:
   //: has a callsign on the map and no identity behind it, so it cannot
   //: be a contact - and everything that addresses a contact fails,
   //: including its own messages arriving at the base.
-  bool sendSlimAdvert();
+  //: Returns the frame's length, 0 if nothing was queued.
+  uint8_t sendSlimAdvert();
   //: "!V" from somebody else: learn them. True if it was one.
   bool slimAdvert(const char* msg);
   //: When the next advert goes out, in millis().
@@ -198,16 +207,17 @@ public:
   //:
   //: The repeater found this the hard way: it answered nothing at all,
   //: no health check and no admin reply, until its replies were deferred
-  //: by SLIM_REPLY_QUIET_MS. The same afternoon a tracker in clear line
+  //: past the asker's burst (slimproto::replyQuietMs). The same afternoon a tracker in clear line
   //: of sight of the base antenna decided it had lost contact and began
   //: keeping a backlog, because every acknowledgement it was owed had
   //: landed inside its own burst. One fault, three symptoms.
   struct Owed {
     uint8_t  to = 0;             // 0: this slot is free
-    uint8_t  type = 0;           // TYPE_ACK or TYPE_STATUS
+    uint8_t  type = 0;           // TYPE_ACK, TYPE_STATUS, or TYPE_TEXT (Held)
     uint8_t  seq = 0;            // the acknowledgement's one body byte
-    uint16_t want = 0;           // which readings a status should carry
+    uint16_t want = 0;           // a status: which readings; an ack: its reach
     unsigned long at = 0;        // not before this
+    slimproto::Link heard = {0, 0, 0};   // the asking frame, for a STATUS
   };
   //: Four. A base hears four units report inside one burst on a busy
   //: callout; a fifth is rarer than the 32 bytes of carrying it.
@@ -216,10 +226,23 @@ public:
   //: The earliest the next owed reply may go. Deferring two onto the same
   //: instant is the same collision wearing a different hat.
   unsigned long _owed_next = 0;
+  //: How long a reply owed now waits: the rest of the burst being answered,
+  //: from that frame's own airtime. Set by onSlimRecv, which is the only
+  //: place anything is owed from.
+  uint32_t _owed_quiet = slimproto::REPLY_QUIET_MIN_MS;
+  //: How long an addressed frame with this much body gets to be
+  //: acknowledged before it goes again. See slimproto::ackWaitMs.
+  uint32_t slimAckWaitMs(uint8_t body_len);
+  //: ...and how long until, having heard nothing of it at all, it is worth
+  //: trying again. See slimproto::fastWaitMs.
+  uint32_t slimFastWaitMs(uint8_t body_len);
 
   //: Owe a reply instead of sending one. Silently dropped if nothing is
   //: free - the asker retries, which is what it is already built to do.
-  void oweSlimReply(uint8_t to, uint8_t type, uint8_t seq, uint16_t want);
+  //: `wait_ms` is an appointment - a slot's moment - rather than a place
+  //: in the queue of replies, so it neither waits for them nor holds them.
+  void oweSlimReply(uint8_t to, uint8_t type, uint8_t seq, uint16_t want,
+                    const slimproto::Link* heard = NULL, uint32_t wait_ms = 0);
   //: Whatever has come due, one per pass. Called from loop().
   void sendOwedSlimReplies();
   //: True while a reply has been promised and not yet sent.
@@ -233,6 +256,91 @@ public:
   //: MTRK01 into tracker mode and the base gave up on it.
   bool owedSlimReply() const;
 
+  //: An addressed message nobody has acknowledged yet, kept so it can go
+  //: again the moment its unit is next heard.
+  //:
+  //: **A tracker listens for about ten seconds after each report and is
+  //: deaf for the rest of the interval**, so a message or a ping sent when
+  //: the operator presses the button reaches it about one time in twelve.
+  //: A unit transmitting is a unit awake: anything authenticated from it
+  //: means its receiver is on now, which is the one moment worth a retry.
+  //: The Pi's SlimBridge has done this since 2026-09-30 (`owed`,
+  //: `_resend_owed`); a tablet base had nothing in its place, and a ping
+  //: from the tablet to a tracker reported "no reply" for a unit that was
+  //: answering every report.
+  //:
+  //: Each retry carries a new sequence number, or the unit drops it as a
+  //: duplicate of the attempt it never heard - so the id the app was given
+  //: is kept and reported whichever attempt lands.
+  struct Held {
+    uint8_t  to = 0;             // 0: this slot is free
+    uint8_t  seq = 0;            // the latest attempt's sequence number
+    uint8_t  tries = 0;
+    uint8_t  timed = 0;          // tries the clock has made, not a hearing
+    uint32_t app_ack = 0;        // the id the app is waiting for
+    unsigned long sent_at = 0;   // the latest attempt
+    uint8_t  len = 0;
+    uint8_t  body[slim::MAX_BODY];
+  };
+  //: One per unit, four units at once: an operator messaging more than
+  //: four sleeping trackers inside one interval is rarer than the 800
+  //: bytes. A fifth replaces the one that has been tried most.
+  static const uint8_t SLIM_HELD_MAX = 4;
+  //: Attempts in all, as the Pi's `owed_tries`.
+  static const uint8_t SLIM_HELD_TRIES = 5;
+  Held _held[SLIM_HELD_MAX];
+  //: Keep a message just sent to `to`, replacing any older one for it.
+  void holdSlimText(uint8_t to, uint8_t seq, uint32_t app_ack,
+                    const uint8_t* body, uint8_t len);
+  //: `unit` was just heard: owe it the held message, if there is one.
+  void wakeHeldSlimText(uint8_t unit);
+  //: ...and send it, from sendOwedSlimReplies when that comes due.
+  void resendHeldSlimText(uint8_t unit);
+  //: A held message whose acknowledgement is overdue goes again on the
+  //: clock, a couple of times, rather than waiting for the unit to be
+  //: heard: trackers listen between reports. Called from loop().
+  void retryHeldSlimText();
+  //: An acknowledgement from `unit` for `seq`. True if it settles a held
+  //: message, with the id the app was given in `app_ack`.
+  bool settleHeldSlimText(uint8_t unit, uint8_t seq, uint32_t& app_ack);
+
+  //: A team message, still owed to the trackers that were asleep when it
+  //: was broadcast.
+  //:
+  //: **A broadcast reaches only the units listening at that instant**, and a
+  //: tracker listens for about ten seconds a report. Seen 2026-10-22: a
+  //: message to "Everyone" from the tablet reached MTRK01, which had just
+  //: reported, and never reached MTRK02. So the base keeps it for every
+  //: tracker it has not heard in the last few seconds and gives each one a
+  //: copy - addressed, so it is acknowledged and retried like any held
+  //: message - the next time that tracker is heard. The base only: it is
+  //: the one node that hears every report.
+  struct TeamHeld {
+    uint16_t owed = 0;                         // units still owed a copy; 0: free
+    uint8_t  len = 0;
+    uint8_t  body[slim::MAX_BODY];
+    uint8_t  seq[slim::ADDR_COUNT];            // each unit's latest attempt
+    uint8_t  tries[slim::ADDR_COUNT];
+    unsigned long sent_at[slim::ADDR_COUNT];   // 0: not tried yet
+  };
+  //: Two: an operator who sends a third team message inside one interval
+  //: has replaced the first one in practice anyway.
+  static const uint8_t SLIM_TEAM_HELD_MAX = 2;
+  TeamHeld _team_held[SLIM_TEAM_HELD_MAX];
+  uint8_t _team_next = 0;
+  //: When each unit was last heard: one heard a moment ago is still
+  //: listening, and already has the broadcast.
+  unsigned long _unit_heard_at[slim::ADDR_COUNT] = {};
+  //: Keep a team message for the trackers that cannot have heard it.
+  void holdTeamText(const uint8_t* body, uint8_t len);
+  //: ...and give `unit` its copy, from sendOwedSlimReplies.
+  void resendTeamText(uint8_t unit, uint8_t which);
+  //: An acknowledgement from `unit` for `seq`: true if it was for a copy.
+  bool settleTeamText(uint8_t unit, uint8_t seq);
+  //: A unit's STATUS, to the app driving this base (PUSH_CODE_SLIM_STATUS):
+  //: how the Pi's gateway hears every one, for the tablet's.
+  void slimStatusToApp(const slim::Frame& f, const slimproto::Link& link);
+
   //: Queue one slim frame `txBurst()` times. Identical copies: the mesh
   //: deduplicates on (SRC, SEQ), so every receiver after the first drops them
   //: for free, and at 13 bytes three copies cost about what one MeshCore
@@ -243,9 +351,10 @@ public:
   //: `prefer_direct` false floods even when a route is known — for a
   //: reachability probe, whose whole job is to find out what can be
   //: reached. See MyMesh::sendLinkTest.
-  bool sendSlimBurst(uint8_t type, const uint8_t* body, uint8_t body_len,
-                     uint8_t dst, uint8_t copies = 0, int ttl = -1,
-                     bool prefer_direct = true);
+  //: Returns the frame's length, 0 if nothing was queued.
+  uint8_t sendSlimBurst(uint8_t type, const uint8_t* body, uint8_t body_len,
+                        uint8_t dst, uint8_t copies = 0, int ttl = -1,
+                        bool prefer_direct = true);
 
   //: Ask the base how this unit sounds from here. False if it could
   //: not be sent at all.
@@ -259,14 +368,15 @@ public:
   //: must not give up before the receiver does, and the receiver must not
   //: stay awake after the screen has.
   //:
-  //: Twelve seconds, which is longer than it used to be. The answer is a
-  //: burst out, the base's turnaround, and a burst back at SF11 - but the
-  //: base no longer answers the instant it decodes the ping. It waits out
-  //: the asker's own burst first (SLIM_REPLY_QUIET_MS), and if it owes
-  //: somebody else an answer as well, one gap behind that. Eight seconds
-  //: was drawn before any of that existed and would now report "no reply"
-  //: to a unit whose reply was on its way.
-  static const uint32_t LINK_TEST_WAIT_MS = 12000;
+  //: Twenty seconds, which is longer than it used to be. The base no
+  //: longer answers the instant it decodes the ping: it waits out the
+  //: asker's own burst first (slimproto::replyQuietMs), and if it owes
+  //: somebody else an answer as well, one gap behind that. At SF12 that is
+  //: about seven seconds for an answer straight back, and a repeater on the
+  //: way adds its hold-off and its own airtime in each direction - twelve
+  //: seconds, drawn at SF11, reported "no reply" to a relayed answer that
+  //: was on its way.
+  static const uint32_t LINK_TEST_WAIT_MS = 20000;
 
   //: A message typed or chosen on this unit's own screen, held until the
   //: base acknowledges it.
@@ -299,13 +409,47 @@ public:
     uint8_t to = 0;               //: 0 = nothing outstanding
     uint8_t type = 0;             //: TYPE_TEXT, or TYPE_GRPTEXT for a marker
     uint8_t seq = 0;              //: what the acknowledgement will name
-    uint8_t tries = 0;
+    uint8_t tries = 0;            //: 0: the first send is still to go
     unsigned long due = 0;        //: when to try again
+    //: When to try again if NOTHING has been heard of it - no answer and no
+    //: repeater carrying it on. See slimproto::fastWaitMs.
+    unsigned long fast_due = 0;
+    bool relayed = false;         //: a repeater was heard carrying this try
     bool acked = false;           //: cleared by the next send
     bool lost = false;
+    bool kept = false;            //: given up on here, held for the base
     bool marker = false;          //: for the screen to name what was lost
+    uint8_t resumed = 0;          //: times a kept one has gone again
+    bool sent_only = false;       //: no base on the net: sent, not awaited
   };
   Outgoing _out;
+  //: **A pin or a message the base never acknowledged is kept, not
+  //: dropped.** Given up on at the edge of range, or pushed out of _out by
+  //: something sent while it was still being tried - on 2026-10-23 MTRK01's
+  //: first pin went both ways at once and never reached the map. Sent again
+  //: the next time the base is heard: what was dropped where the radio
+  //: failed is the one most worth having. Messages too since 2026-10-29 -
+  //: "not delivered" for words that were simply out of range was the screen
+  //: giving up on the person's behalf. Oldest first; only a fifth pushes out
+  //: the oldest. Positions and trails never touch this.
+  static const uint8_t SLIM_PINS_OWED = 4;
+  Outgoing _pins_owed[SLIM_PINS_OWED];
+  void holdPin();
+  void resumePin();
+
+  //: Words shown once: the same text from the same unit inside
+  //: SLIM_REPEAT_MS, with nothing said to that unit since, is a retry whose
+  //: first copy landed while only its acknowledgement was lost, or a held
+  //: copy of something already shown. Acknowledged every time regardless.
+  struct SeenText { uint8_t src; uint32_t hash; unsigned long at; };
+  static const uint8_t SLIM_SEEN_TEXTS = 8;
+  SeenText _seen_text[SLIM_SEEN_TEXTS] = {};
+  uint8_t _seen_text_next = 0;
+  bool repeatText(uint8_t src, const char* msg);
+  //: Words said to `to` (ADDR_BROADCAST: to everyone), so the same words
+  //: back are an answer to them - a second "OK" to a second question - and
+  //: not a retry.
+  void saidTo(uint8_t to);
 
   //: Send it, and hold it for the ladder. The one path both a message and
   //: a marker take, so neither can quietly stop being retried.
@@ -320,8 +464,13 @@ public:
   //: What became of the last thing sent from this screen, for the
   //: screen to say so: 0 nothing, 1 waiting, 2 delivered, 3 lost.
   uint8_t textState() const;
-  //: Which attempt is in flight, for "SENDING 2/3".
-  uint8_t textTries() const { return _out.tries; }
+  //: Which attempt is in flight, for "SENDING 2/3" - the first while it
+  //: steps around somebody's report, too.
+  uint8_t textTries() const { return _out.tries ? _out.tries : 1; }
+  //: How long to hold a message of this many body bytes so it does not
+  //: start on top of another tracker's report: 0 almost always. See
+  //: MyMesh.cpp.
+  uint32_t stepAroundMs(uint8_t body_len);
 
   //: True while a message is outstanding and its acknowledgement could
   //: still arrive - the radio must stay listening for it, exactly as it
@@ -342,6 +491,49 @@ public:
   //: there is nothing to import and no new data anywhere. Returns how many
   //: contacts mapped. Cheap enough to re-run whenever contacts change.
   int loadSlimRoster();
+
+  // ---- the base's side of a round ----------------------------------
+  //
+  // Any slim base, not only a tracker build: the tablet's node is built
+  // without tracker mode, and the base is the side that runs the round.
+  //
+  // Set by the app with the custom variable `round`. "180,21,7,12300" is
+  // a three-minute round of 21-second slots for trackers 1-7, each
+  // acknowledged 12.3 s into its own slot - the plan slim_round.plan()
+  // makes on the Pi, and core/base_engine.js on the tablet. "300,7" -
+  // round and slot only - is a round set by hand: no acknowledgement per
+  // tracker, the round-ack answers everyone. Zero, the default, means no
+  // rounds: each report is acknowledged as it arrives.
+
+  //: One frame at the end of every round: the time, the slot length, and
+  //: who was heard. Against sixteen separate acknowledgements, which at
+  //: SF12 are 40 seconds of airtime and sixteen more chances to collide.
+  void roundLoop();
+  bool setRound(const char* spec);
+  //: A report's acknowledgement on rounds: at the fixed moment in that
+  //: tracker's own slot, after the last relay of its report can have gone,
+  //: as SlimBridge._ack_report does on the Pi. Outside its slot, at once.
+  void oweSlotAck(uint8_t unit, uint8_t seq, uint16_t want);
+
+  uint32_t _round_s = 0;        // the round, or 0 for none
+  uint8_t _round_slot_s = 0;
+  uint8_t _round_units = slimround::MAX_UNIT;   // slots in use
+  uint32_t _round_ack_in_ms = 0;  // into a slot; 0: the round-ack only
+  uint16_t _round_heard = 0;    // who has reported since the last ack
+  uint32_t _round_ack_at = 0;   // the round whose ack has already gone
+
+  //: **A slot is a moment in GPS time, and this node has no GPS.** Every
+  //: tracker times its report from its own fix, so a base whose clock is
+  //: three seconds out answers into the next tracker's report. The app
+  //: sets this from the tablet's GNSS clock with the custom variable
+  //: `clock` (epoch milliseconds), either way - CMD_SET_DEVICE_TIME only
+  //: ever moves the clock forward, so a clock that ran fast stayed fast.
+  bool setClockMs(const char* spec);
+  //: Real time to the millisecond: from `clock` once the app has set it,
+  //: the RTC's whole seconds before that.
+  uint64_t epochMs();
+  uint64_t _clock_ms = 0;            // epoch ms when set; 0: never
+  unsigned long _clock_millis = 0;   // this node's millis() at that moment
 #endif
 #ifdef WITH_TRACKER_MODE
   //: Every packet off the air passes through here, on either protocol,
@@ -377,24 +569,10 @@ public:
   //: otherwise, so a unit slots itself from its own GPS clock rather
   //: than waiting for a base that may not be running rounds.
   uint8_t _slot_s = TRACKER_SLOT_S;
-
-  // ---- the base's side of a round ----------------------------------
-  //
-  // Set by the app with the custom variable `round` as "300,7" - the
-  // round in seconds and a slot in seconds. Zero, the default, means this
-  // node is not running rounds and acknowledges each report as it arrives,
-  // which is right for a handful of units and wrong for sixteen.
-
-  //: One frame at the end of every round: the time, the slot length, and
-  //: who was heard. Against sixteen separate acknowledgements, which at
-  //: SF12 are 40 seconds of airtime and sixteen more chances to collide.
-  void roundLoop();
-  bool setRound(const char* spec);
-
-  uint32_t _round_s = 0;        // the round, or 0 for none
-  uint8_t _round_slot_s = 0;
-  uint16_t _round_heard = 0;    // who has reported since the last ack
-  uint32_t _round_ack_at = 0;   // the round whose ack has already gone
+  //: Who reported in the last round, from its round-ack, and when that came:
+  //: the reports a message steps around. See stepAroundMs.
+  uint16_t _round_seen = 0;
+  unsigned long _round_seen_at = 0;
 
 #endif
 
@@ -530,7 +708,22 @@ public:
   //: For the menu: the interval (0 is off), what it is doing, and how many
   //: fixes the base is still owed.
   uint32_t trackerInterval() const { return _tracker.interval(); }
+  //: **No base on this net** - phones and trackers only. Reports still go out
+  //: as broadcasts at the interval, but nothing waits for an acknowledgement
+  //: no base is going to send: no kept points, no history, no searching, no
+  //: ten-minute adverts, no "NO BASE" alarm, and a pin is sent rather than
+  //: held. Saved across restarts in /nobase. Also custom variable nobase:0|1.
+  bool noBase() const { return _no_base; }
+  bool setNoBase(bool on);
+  bool _no_base = false;
+  //: A report has gone: wait for its acknowledgement, unless no base is
+  //: going to send one.
+  void trackerSent(const tracker::Fix& fix, uint8_t seq);
   tracker::Phase trackerPhase() const { return _tracker.phase(); }
+  //: The same test trackerLoop reports on. A slotted unit holds the FIX
+  //: phase with a fix in hand until its moment comes, so the phase alone
+  //: cannot say whether the sky has been found.
+  bool trackerHasFix() const { return _fixes >= tracker::FIX_SETTLE; }
   uint16_t trackerOwed() const { return _reports.backlog().size(); }
   //: Reports in a row the base did not answer. 0 means in contact.
   uint8_t trackerMissed() const { return _reports.missed(); }
@@ -647,6 +840,12 @@ private:
   ContactInfo* trackerBase();
   //: The next piece of the backlog, if one is due. See tracker::Reports.
   void trackerHistory();
+  //: When the held history goes: long enough for the base's relay of the
+  //: report and the repeater's relays of it and of the acknowledgement, at
+  //: SF12 - each up to two and a half airtimes of hold and one of air.
+  //: Inside the twenty-second listen window.
+  static const unsigned long TRACKER_HIST_HOLD_MS = 8000;
+  unsigned long _hist_at = 0;
 
   //: Tell whoever is carrying this unit whether it is still in touch.
   //: Nothing if there is no buzzer, and nothing while it is muted -
@@ -672,6 +871,10 @@ private:
   //: marker's identity, so re-sending the pair moves that pin rather
   //: than adding one - see slimcodec::encodeMarker.
   uint8_t _marker_num = 0;
+  //: The advert waiting on a base's acknowledgement, and how many times it
+  //: has gone; 0 when none is waiting. See SLIM_ADVERT_TRIES.
+  uint8_t _slim_advert_seq = 0;
+  uint8_t _slim_advert_tries = 0;
 #endif
 
   // helpers, short-cuts

@@ -120,6 +120,7 @@ public:
 };
 
 class HomeScreen : public UIScreen {
+public:
   enum HomePage {
     FIRST,
     RECENT,
@@ -152,9 +153,31 @@ class HomeScreen : public UIScreen {
 #ifdef WITH_TRACKER_MODE
     TRACKER,
 #endif
+#ifdef WITH_SLIM_UI
+    //: Everything a hike does not need - Bluetooth, sound, range test,
+    //: advert, radio - behind one page that opens a list (SettingsScreen).
+    //: Field feedback, 2026-10-27: too many pages to side-scroll past.
+    SETTINGS,
+#endif
     SHUTDOWN,
     Count    // keep as last
   };
+#ifdef WITH_SLIM_UI
+  //: On the side-scroll: what is reached for on a hike. Every other page is
+  //: opened from Settings, and left or right from it goes back there.
+  static bool onCarousel(uint8_t p) {
+    return p == FIRST
+#if defined(WITH_MESH_SLIM) && UI_HAS_JOYSTICK
+        || p == MESSAGES || p == SEND || p == MARKER
+#endif
+#ifdef WITH_TRACKER_MODE
+        || p == TRACKER
+#endif
+        || p == SETTINGS;
+  }
+  void showPage(uint8_t p) { _page = p; }
+#endif
+private:
 
   UITask* _task;
 #ifdef WITH_SLIM_UI
@@ -273,6 +296,19 @@ public:
 
     // curr page indicator
     int y = 14;
+#ifdef WITH_SLIM_UI
+    // Only the side-scroll's pages; a settings page lights Settings.
+    uint8_t shown = 0;
+    for (uint8_t i = 0; i < HomePage::Count; i++) if (onCarousel(i)) shown++;
+    const uint8_t lit = onCarousel(_page) ? _page : (uint8_t)HomePage::SETTINGS;
+    int x = display.width() / 2 - 5 * (shown - 1);
+    for (uint8_t i = 0; i < HomePage::Count; i++) {
+      if (!onCarousel(i)) continue;
+      if (i == lit) display.fillRect(x-1, y-1, 3, 3);
+      else display.fillRect(x, y, 1, 1);
+      x += 10;
+    }
+#else
     int x = display.width() / 2 - 5 * (HomePage::Count-1);
     for (uint8_t i = 0; i < HomePage::Count; i++, x += 10) {
       if (i == _page) {
@@ -281,6 +317,7 @@ public:
         display.fillRect(x, y, 1, 1);
       }
     }
+#endif
 
     if (_page == HomePage::FIRST) {
       display.setColor(DisplayDriver::YELLOW);
@@ -314,13 +351,27 @@ public:
         } else if (msg_state == 2) {
           display.setColor(DisplayDriver::GREEN);
           sprintf(tmp, "%s DELIVERED", what);
+        } else if (msg_state == 5) {
+          // No base mode: sent once, and nobody is going to answer it.
+          display.setColor(DisplayDriver::GREEN);
+          sprintf(tmp, "%s SENT", what);
+        } else if (msg_state == 4) {
+          // Not lost: kept, and sent the moment the base is heard again - a
+          // message as well as a pin since 2026-10-29.
+          display.setColor(DisplayDriver::YELLOW);
+          sprintf(tmp, "%s HELD TILL BASE", what);
         } else {
           display.setColor(DisplayDriver::RED);
           sprintf(tmp, "%s NOT DELIVERED", what);
         }
         display.drawTextCentered(display.width() / 2, 43, tmp);
       } else if (the_mesh.trackerInterval()) {
-        if (the_mesh.trackerSearching()) {
+        if (the_mesh.noBase()) {
+          // Chosen, not a fault: phones and trackers only, nothing to wait for.
+          display.setColor(DisplayDriver::LIGHT);
+          display.setTextSize(1);
+          display.drawTextCentered(display.width() / 2, 43, "NO BASE MODE");
+        } else if (the_mesh.trackerSearching()) {
           display.setColor(DisplayDriver::RED);
           display.setTextSize(1);
           // The count is the reassurance: the walk is being kept.
@@ -420,7 +471,22 @@ public:
           _task->isSerialEnabled() ? bluetooth_on : bluetooth_off,
           32, 32);
       display.setTextSize(1);
+#ifdef WITH_SLIM_UI
+      // The PIN where pairing happens. A unit with a screen picks a new one
+      // each boot and the home page showed it only when nothing else was on
+      // that line - in tracker mode, never, so no phone could pair
+      // (2026-10-23).
+      if (_task->isSerialEnabled() && _task->hasConnection()) {
+        display.drawTextCentered(display.width() / 2, 64 - 11, "connected");
+      } else if (_task->isSerialEnabled() && the_mesh.getBLEPin() != 0) {
+        sprintf(tmp, "PIN %d", the_mesh.getBLEPin());
+        display.drawTextCentered(display.width() / 2, 64 - 11, tmp);
+      } else {
+        display.drawTextCentered(display.width() / 2, 64 - 11, "toggle: " PRESS_LABEL);
+      }
+#else
       display.drawTextCentered(display.width() / 2, 64 - 11, "toggle: " PRESS_LABEL);
+#endif
 #if defined(PIN_BUZZER) && defined(WITH_SLIM_UI)
     } else if (_page == HomePage::SOUND) {
       display.setColor(DisplayDriver::GREEN);
@@ -625,11 +691,27 @@ public:
       if (every) {
         // What it is doing now, and how many fixes the base has not had yet.
         static const char* PHASES[] = {"off", "getting fix", "listening", "asleep"};
-        sprintf(tmp, "%s  owed %u", PHASES[the_mesh.trackerPhase()],
-                (unsigned)the_mesh.trackerOwed());
+        // A slotted unit waits out the GPS lead in FIX with a fix already
+        // held - 45 s of every 60 on a three-minute trail - and "getting
+        // fix" there read as a GPS that could not see the sky.
+        const tracker::Phase phase = the_mesh.trackerPhase();
+        const char* doing = (phase == tracker::FIX && the_mesh.trackerHasFix())
+                            ? "has fix" : PHASES[phase];
+        if (the_mesh.noBase()) sprintf(tmp, "%s  no base", doing);
+        else sprintf(tmp, "%s  owed %u", doing, (unsigned)the_mesh.trackerOwed());
         display.drawTextCentered(display.width() / 2, 43, tmp);
       }
       display.drawTextCentered(display.width() / 2, 64 - 11, "change: " PRESS_LABEL);
+#endif
+#ifdef WITH_SLIM_UI
+    } else if (_page == HomePage::SETTINGS) {
+      display.setColor(DisplayDriver::YELLOW);
+      display.setTextSize(1);
+      display.drawTextCentered(display.width() / 2, 18, "Settings");
+      display.setColor(DisplayDriver::LIGHT);
+      display.drawTextCentered(display.width() / 2, 32, "Bluetooth, sound,");
+      display.drawTextCentered(display.width() / 2, 41, "range test, radio");
+      display.drawTextCentered(display.width() / 2, 64 - 11, "open: " PRESS_LABEL);
 #endif
     } else if (_page == HomePage::SHUTDOWN) {
       display.setColor(DisplayDriver::GREEN);
@@ -645,6 +727,20 @@ public:
   }
 
   bool handleInput(char c) override {
+#ifdef WITH_SLIM_UI
+    if (c == KEY_LEFT || c == KEY_PREV || c == KEY_NEXT || c == KEY_RIGHT) {
+      // Out of a settings page: back to Settings, not on round the carousel.
+      if (!onCarousel(_page)) { _page = HomePage::SETTINGS; return true; }
+      const uint8_t step = (c == KEY_LEFT || c == KEY_PREV)
+                           ? HomePage::Count - 1 : 1;
+      do { _page = (_page + step) % HomePage::Count; } while (!onCarousel(_page));
+      return true;
+    }
+    if (c == KEY_ENTER && _page == HomePage::SETTINGS) {
+      _task->gotoSettings();
+      return true;
+    }
+#else
     if (c == KEY_LEFT || c == KEY_PREV) {
       _page = (_page + HomePage::Count - 1) % HomePage::Count;
       return true;
@@ -656,6 +752,7 @@ public:
       }
       return true;
     }
+#endif
 #ifdef WITH_SLIM_UI
     // Five presses on the info page opens the range test. Not a page on
     // the carousel: everything there is something an operator does
@@ -1275,7 +1372,7 @@ public:
       display.setColor(DisplayDriver::LIGHT);
       display.setTextSize(2);
       display.drawTextCentered(display.width() / 2, 18, "asking...");
-      // Counted down, because twelve seconds of a motionless word is a
+      // Counted down, because twenty seconds of a motionless word is a
       // unit somebody decides has frozen and switches off.
       display.setTextSize(1);
       sprintf(tmp, "%lus", (unsigned long)((WAIT_MS - waiting + 999) / 1000));
@@ -1363,15 +1460,21 @@ static const uint8_t TRACK_EVERY_COUNT =
   (uint8_t)(sizeof(TRACK_EVERY) / sizeof(TRACK_EVERY[0]));
 
 class TrackerScreen : public PickScreen {
-  char _row[TRACK_EVERY_COUNT][16];
+  //: One row more than there are intervals: the base switch, last. See
+  //: MyMesh::noBase.
+  char _row[TRACK_EVERY_COUNT + 1][16];
 
 protected:
-  const char* label(uint8_t i) override { return _row[i]; }
+  const char* label(uint8_t i) override {
+    if (i == TRACK_EVERY_COUNT)
+      return the_mesh.noBase() ? "No base: ON" : "No base: off";
+    return _row[i];
+  }
   void chose(uint8_t i) override;
 
 public:
   TrackerScreen(UITask* task)
-    : PickScreen(task, "Report every", TRACK_EVERY_COUNT) {
+    : PickScreen(task, "Report every", TRACK_EVERY_COUNT + 1) {
     for (uint8_t i = 0; i < TRACK_EVERY_COUNT; i++) {
       const uint32_t s = TRACK_EVERY[i];
       if (!s) strcpy(_row[i], "Off");
@@ -1390,6 +1493,50 @@ public:
     _sel = 0;
   }
 };
+
+#ifdef WITH_SLIM_UI
+//: The settings list: everything off the side-scroll. Each row opens the page
+//: it always had, so what it does there is unchanged; left or right from that
+//: page comes back to Settings. The range test is here rather than behind
+//: five presses on the home page: it is for whoever sites repeaters.
+class SettingsScreen : public PickScreen {
+  struct Item { const char* name; int8_t page; };   // page -1: range test
+  static const Item ITEMS[];
+  static const uint8_t COUNT;
+
+protected:
+  const char* label(uint8_t i) override { return ITEMS[i].name; }
+  void chose(uint8_t i) override {
+    if (ITEMS[i].page < 0) _task->gotoLinkTest();
+    else _task->gotoHomePage((uint8_t)ITEMS[i].page);
+  }
+
+public:
+  SettingsScreen(UITask* task) : PickScreen(task, "Settings", COUNT) {}
+};
+const SettingsScreen::Item SettingsScreen::ITEMS[] = {
+  {"Bluetooth", HomeScreen::BLUETOOTH},
+#if defined(PIN_BUZZER)
+  {"Sound", HomeScreen::SOUND},
+#endif
+  {"Range test", -1},
+  {"Send advert", HomeScreen::ADVERT},
+  {"Radio", HomeScreen::RADIO},
+#if ENV_INCLUDE_GPS == 1
+  {"GPS", HomeScreen::GPS},
+#endif
+#if UI_SENSORS_PAGE == 1
+  {"Sensors", HomeScreen::SENSORS},
+#endif
+#ifdef WITH_MESH_SLIM
+  {"Protocol", HomeScreen::PROTOCOL},
+#endif
+  {"Recent adverts", HomeScreen::RECENT},
+  {"Power off", HomeScreen::SHUTDOWN},
+};
+const uint8_t SettingsScreen::COUNT =
+  (uint8_t)(sizeof(SettingsScreen::ITEMS) / sizeof(SettingsScreen::ITEMS[0]));
+#endif
 
 //: What kind of pin, and then what to call it.
 class MarkerScreen : public PickScreen {
@@ -1418,6 +1565,14 @@ void CannedScreen::chose(uint8_t i) {
 }
 
 void TrackerScreen::chose(uint8_t i) {
+  if (i == TRACK_EVERY_COUNT) {
+    const bool on = !the_mesh.noBase();
+    the_mesh.setNoBase(on);
+    _task->notify(UIEventType::ack);
+    _task->showAlert(on ? "No base: ON" : "No base: off", 1000);
+    _task->gotoHomeScreen();
+    return;
+  }
   const uint32_t every = TRACK_EVERY[i];
   if (!the_mesh.setTrackerMode(every)) {
     _task->showAlert("No GPS: can't track", 1500);
@@ -1450,6 +1605,11 @@ int UITask::msgsKept() const {
 void UITask::gotoSend() { setCurrScreen(send_menu); }
 void UITask::gotoMarker() { setCurrScreen(marker_menu); }
 void UITask::gotoLinkTest() { setCurrScreen(link_test); }
+void UITask::gotoSettings() { setCurrScreen(settings_menu); }
+void UITask::gotoHomePage(uint8_t page) {
+  ((HomeScreen *) home)->showPage(page);
+  setCurrScreen(home);
+}
 void UITask::gotoTrackerEvery() {
   every_menu->openHere();
   setCurrScreen(every_menu);
@@ -1503,6 +1663,7 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   marker_menu = new MarkerScreen(this);
   every_menu = new TrackerScreen(this);
   link_test = new LinkTestScreen(this);
+  settings_menu = new SettingsScreen(this);
   compose = new ComposeScreen(this);
 #endif
   setCurrScreen(splash);

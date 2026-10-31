@@ -59,6 +59,31 @@ static const uint8_t SAMPLES = 4;
 static const uint8_t DELTAS = SAMPLES - 1;
 static const uint8_t BODY_BYTES = 15;
 
+// ---- the compact form (2026-10-29) ----------------------------------------
+//
+// What a tracker sends: ten bytes, a 17-byte frame - the top of the airtime
+// block below 22, so 1.71 s at SF12/125 kHz instead of 1.97, for the report
+// and every relay of it. slim_track.py says why it is shaped as it is.
+//
+//     bits
+//       0-1    form       1
+//       2-5    cadence    as above
+//       6-7    scale      a step of 5 m x 4^scale: 5, 20, 80 or 320 m
+//       8-55   position   48 bits, the same exact absolute - never boxed
+//      56-67   sample -1  east 6 bits, north 6 bits
+//      68-79   sample -2
+static const uint8_t COMPACT_FORM = 1;
+static const uint8_t COMPACT_BYTES = 10;
+static const uint8_t COMPACT_SAMPLES = 3;
+static const uint8_t COMPACT_BITS = 6;
+static const int16_t COMPACT_MIN = -31, COMPACT_MAX = 31;
+static const int16_t COMPACT_NONE = -32;
+extern const double COMPACT_STEPS_M[4];
+
+//: What a tracker sends. Both forms are read.
+static const uint8_t REPORT_BYTES = COMPACT_BYTES;
+static const uint8_t REPORT_SAMPLES = COMPACT_SAMPLES;
+
 //: Seconds between samples, by the four-bit field. **Append only** - the index
 //: is the wire format. Index 0 is a minute because that is what a four-minute
 //: report wants, and the common case should be the one a build with a wrong
@@ -82,16 +107,25 @@ uint8_t cadenceIndex(uint16_t seconds);
 int encode(const Point* points, uint8_t count, uint16_t cadence_s,
            uint8_t* out, uint8_t cap);
 
-//: The samples back, newest first. Returns how many, or -1 for a body that is
-//: not a track. `cadence_s` is what the sender said, not what anyone assumed.
+//: The same in the compact form: up to COMPACT_SAMPLES points as one
+//: COMPACT_BYTES body, at the finest scale that carries the most of them.
+int encodeCompact(const Point* points, uint8_t count, uint16_t cadence_s,
+                  uint8_t* out, uint8_t cap);
+
+//: The samples back, newest first, from either form. Returns how many, or -1
+//: for a body that is not a track. `cadence_s` is what the sender said, not
+//: what anyone assumed.
 int decode(const uint8_t* body, uint8_t len, Point* out, uint8_t cap,
            uint16_t& cadence_s);
 
-//: Told apart from a plain position by length: six bytes against fifteen.
+//: Told apart from a plain position by length: six bytes against fifteen,
+//: or ten for the compact form.
 bool isTrack(const uint8_t* body, uint8_t len);
 
 //: How many samples a report at this interval can actually carry. Padding it
 //: with samples never taken is how a trail grows places a team never stood.
-uint8_t samplesFor(uint32_t interval_s, uint16_t cadence_s);
+//: `cap` is what the form holds: REPORT_SAMPLES for the compact.
+uint8_t samplesFor(uint32_t interval_s, uint16_t cadence_s,
+                   uint8_t cap = SAMPLES);
 
 }  // namespace slimtrack

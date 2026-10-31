@@ -126,6 +126,12 @@
 #define PUSH_CODE_CONTROL_DATA          0x8E   // v8+
 #define PUSH_CODE_CONTACT_DELETED       0x8F // used to notify client app of deleted contact when overwriting oldest
 #define PUSH_CODE_CONTACTS_FULL         0x90 // used to notify client app that contacts storage is full
+#ifdef WITH_MESH_SLIM
+//: Slim's own pushes start at 0xA0, clear of MeshCore's, which count up from
+//: 0x80. [code][unit][key 6][hops][via][snr x4][-rssi][status body] - see
+//: MyMesh::slimStatusToApp, and parseSlimStatus in the app.
+#define PUSH_CODE_SLIM_STATUS           0xA0
+#endif
 
 #define ERR_CODE_UNSUPPORTED_CMD        1
 #define ERR_CODE_NOT_FOUND              2
@@ -674,36 +680,70 @@ int MyMesh::loadSlimRoster() {
   return mapped;
 }
 
-//: How long a reply waits before it goes on the air. See MyMesh::Owed:
-//: a reply sent from inside the receive callback lands in the tail of
-//: the burst that asked for it and is never heard. The repeater's
-//: constant of the same name is this same number - one fact about a
-//: half-duplex radio, not two settings - and both are comfortably
-//: inside a tracker's ten-second listening window (TRACKER_LISTEN_S),
-//: which is what a deferred reply has to arrive within.
-static const unsigned long SLIM_REPLY_QUIET_MS = 2500;
-//: How long to wait for a message's acknowledgement, and how many times
-//: to try. Eight seconds is a burst out, the base's own reply delay
-//: (SLIM_REPLY_QUIET_MS) and a burst back with a hop each way; three
-//: attempts across half a minute is as long as anyone will stand holding
-//: a handheld waiting to see whether what they said arrived.
-static const unsigned long SLIM_TEXT_ACK_MS = 8000;
+//: How many times to try a message. How long each attempt waits for its
+//: acknowledgement is slimAckWaitMs: a burst out, the far end's hold-off
+//: and its answer, from the message's own airtime. A flat eight seconds
+//: was written at SF11/250k; at SF12 a thirty-character message is two
+//: seconds a copy, its acknowledgement could not arrive in time, and the
+//: retry went under a new sequence number - the same words shown twice.
 static const uint8_t SLIM_TEXT_TRIES = 3;
 //: And how far apart two owed replies go out.
 static const unsigned long SLIM_REPLY_GAP_MS = 2000;
 
-bool MyMesh::sendSlimBurst(uint8_t type, const uint8_t* body, uint8_t body_len,
-                           uint8_t dst, uint8_t copies, int ttl,
-                           bool prefer_direct) {
+//: How far an acknowledgement may travel: as far as the frame it answers
+//: came, which is one relay more than it needed - the spare covers a path
+//: weaker one way than the other - and never further than a flood starts.
+//: A fixed 2 pulled two tiers of relays in behind a request heard directly,
+//: and answered one that crossed two repeaters with no spare at all.
+//: slim_node._send_ack applies the same rule.
+static uint8_t ackReach(const slim::Frame& f) {
+  const uint8_t hops = f.hops ? f.hops : 1;
+  return hops < slim::TTL_INIT ? hops : slim::TTL_INIT;
+}
+
+//: As long as a retry ladder or a held copy can bring the same words back: a
+//: held message goes again at the unit's next report, three times.
+//: slim_node.TEXT_REPEAT_S is the same ten minutes.
+static const unsigned long SLIM_REPEAT_MS = 600000UL;
+
+bool MyMesh::repeatText(uint8_t src, const char* msg) {
+  uint32_t h = 2166136261UL;                     // FNV-1a
+  for (const char* p = msg; *p; p++) { h ^= (uint8_t)*p; h *= 16777619UL; }
+  const unsigned long now = _ms->getMillis();
+  for (uint8_t i = 0; i < SLIM_SEEN_TEXTS; i++) {
+    const SeenText& t = _seen_text[i];
+    if (t.at && t.src == src && t.hash == h && now - t.at < SLIM_REPEAT_MS) {
+      return true;
+    }
+  }
+  SeenText& t = _seen_text[_seen_text_next];
+  _seen_text_next = (uint8_t)((_seen_text_next + 1) % SLIM_SEEN_TEXTS);
+  t.src = src;
+  t.hash = h;
+  t.at = now ? now : 1;                          // 0 marks a free slot
+  return false;
+}
+
+void MyMesh::saidTo(uint8_t to) {
+  for (uint8_t i = 0; i < SLIM_SEEN_TEXTS; i++) {
+    if (to == slim::ADDR_BROADCAST || _seen_text[i].src == to) {
+      _seen_text[i].at = 0;
+    }
+  }
+}
+
+uint8_t MyMesh::sendSlimBurst(uint8_t type, const uint8_t* body,
+                              uint8_t body_len, uint8_t dst, uint8_t copies,
+                              int ttl, bool prefer_direct) {
   // Build once, then copy. The frame must be byte-identical across the burst -
   // same SEQ, same tag - or receivers treat each copy as a new packet and the
   // whole point is lost.
   mesh::Packet* first = obtainNewPacket();
-  if (first == NULL) return false;
+  if (first == NULL) return 0;
   const int n = slimproto::buildOutbound(first, type, body, body_len, dst,
                                          _ms->getMillis(), ttl,
                                          prefer_direct);
-  if (n < 0) { releasePacket(first); return false; }
+  if (n < 0) { releasePacket(first); return 0; }
 
   if (copies == 0) copies = slimproto::txBurst();
   for (uint8_t c = 1; c < copies; c++) {
@@ -719,36 +759,261 @@ bool MyMesh::sendSlimBurst(uint8_t type, const uint8_t* body, uint8_t body_len,
     sendPacket(dup, 1, 0);
   }
   sendPacket(first, 1, 0);
-  return true;
+  return (uint8_t)n;
 }
 
 void MyMesh::oweSlimReply(uint8_t to, uint8_t type, uint8_t seq,
-                          uint16_t want) {
+                          uint16_t want, const slimproto::Link* heard,
+                          uint32_t wait_ms) {
   if (!to) return;
   for (uint8_t i = 0; i < SLIM_OWED_MAX; i++) {
     if (_owed[i].to) continue;
     const unsigned long now = _ms->getMillis();
-    unsigned long at = now + SLIM_REPLY_QUIET_MS;
-    // Behind whatever is already owed, so two replies do not go out on
-    // the same instant and collide with each other instead.
-    if (_owed_next > now && _owed_next + SLIM_REPLY_GAP_MS > at) {
-      at = _owed_next + SLIM_REPLY_GAP_MS;
+    unsigned long at = now + _owed_quiet;
+    if (wait_ms) {
+      // A slot's moment, seconds off: queued behind nothing, and nothing
+      // queued behind it - a text's ack must not wait for a slot.
+      at = now + wait_ms;
+    } else {
+      // Behind whatever is already owed, so two replies do not go out on
+      // the same instant and collide with each other instead.
+      if (_owed_next > now && _owed_next + SLIM_REPLY_GAP_MS > at) {
+        at = _owed_next + SLIM_REPLY_GAP_MS;
+      }
+      _owed_next = at;
     }
-    _owed_next = at;
     _owed[i].to = to;
     _owed[i].type = type;
     _owed[i].seq = seq;
     _owed[i].want = want;
     _owed[i].at = at;
+    _owed[i].heard = heard ? *heard : slimproto::Link{0, 0, 0};
     return;
   }
   // Nothing free: dropped rather than sent now. Sending now is the fault
   // this exists to avoid, and the asker retries.
 }
 
+uint32_t MyMesh::slimAckWaitMs(uint8_t body_len) {
+  // An addressed frame's header and tag: what MAX_BODY leaves room for.
+  const int frame = body_len + (SLIM_MAX_FRAME - slim::MAX_BODY);
+  return slimproto::ackWaitMs(_radio->getEstAirtimeFor(frame));
+}
+
 bool MyMesh::owedSlimReply() const {
   for (uint8_t i = 0; i < SLIM_OWED_MAX; i++) {
     if (_owed[i].to) return true;
+  }
+  return false;
+}
+
+void MyMesh::holdSlimText(uint8_t to, uint8_t seq, uint32_t app_ack,
+                          const uint8_t* body, uint8_t len) {
+  if (!to || to == slim::ADDR_BROADCAST || len > slim::MAX_BODY) return;
+  // Its own slot first: a newer message to the same unit replaces the older,
+  // so a unit is never owed two things and the newest is what it gets.
+  Held* h = NULL;
+  for (uint8_t i = 0; i < SLIM_HELD_MAX && !h; i++) {
+    if (_held[i].to == to) h = &_held[i];
+  }
+  for (uint8_t i = 0; i < SLIM_HELD_MAX && !h; i++) {
+    if (!_held[i].to) h = &_held[i];
+  }
+  if (!h) {
+    h = &_held[0];
+    for (uint8_t i = 1; i < SLIM_HELD_MAX; i++) {
+      if (_held[i].tries > h->tries) h = &_held[i];
+    }
+  }
+  h->to = to;
+  h->seq = seq;
+  h->tries = 1;
+  h->timed = 0;
+  h->app_ack = app_ack;
+  h->sent_at = _ms->getMillis();
+  h->len = len;
+  memcpy(h->body, body, len);
+}
+
+void MyMesh::wakeHeldSlimText(uint8_t unit) {
+  if (unit > slim::MAX_ADDR) return;
+  const unsigned long now = _ms->getMillis();
+  _unit_heard_at[unit] = now;
+  // **One thing per hearing.** Whatever goes next has to leave the channel
+  // clear for the unit's acknowledgement of it: a second message owed
+  // behind the first is the base transmitting over the very answer it is
+  // waiting for. The rest waits for the next report - a direct message
+  // first, then team messages oldest first.
+  //
+  // The attempt is stamped when it is owed, not only when it goes, so a
+  // second frame from the unit inside the reply delay cannot owe it twice.
+  for (uint8_t i = 0; i < SLIM_HELD_MAX; i++) {
+    Held& h = _held[i];
+    if (h.to != unit) continue;
+    // The latest attempt gets its chance first. A unit that is awake when
+    // the message goes answers within a few seconds, and resending before
+    // then only sends it twice.
+    if (now - h.sent_at < slimAckWaitMs(h.len)) return;
+    // Owed rather than sent, like any reply: what woke us is the first copy
+    // of the unit's own burst, and it is deaf until the burst is over.
+    h.sent_at = now;
+    oweSlimReply(unit, slim::TYPE_TEXT, 0, 0);
+    return;
+  }
+  for (uint8_t k = 0; k < SLIM_TEAM_HELD_MAX; k++) {
+    // _team_next is the slot written next, so the oldest - start there.
+    const uint8_t w = (uint8_t)((_team_next + k) % SLIM_TEAM_HELD_MAX);
+    TeamHeld& t = _team_held[w];
+    if (!(t.owed & (1u << unit))) continue;
+    if (t.sent_at[unit] && now - t.sent_at[unit] < slimAckWaitMs(t.len)) {
+      return;
+    }
+    t.sent_at[unit] = now;
+    oweSlimReply(unit, slim::TYPE_GRPTEXT, 0, w);   // `want` carries which
+    return;
+  }
+}
+
+//: Heard this recently, a tracker had the broadcast live and needs no copy:
+//: it sniffs between reports (startSniffing), so one heard inside about two
+//: report intervals is in range and listening. Twelve seconds - the listen
+//: window after a report - was right while trackers slept through the rest
+//: of the interval; once they sniffed, the copy only showed the message a
+//: second time (2026-10-27). slim_node.TEAM_AWAKE_S is the same.
+static const unsigned long SLIM_AWAKE_MS = 360000UL;
+
+void MyMesh::holdTeamText(const uint8_t* body, uint8_t len) {
+  if (slimproto::unit() != slim::ADDR_BASE || len > slim::MAX_BODY) return;
+  const unsigned long now = _ms->getMillis();
+  uint16_t owed = 0;
+  for (uint8_t u = 1; u <= slim::MAX_ADDR; u++) {
+    if (u == slim::ADDR_BASE || slimproto::pubKeyForUnit(u) == NULL) continue;
+    if (slimcompanion::unitRole(u) != slimcodec::ROLE_TRACKER) continue;
+    if (_unit_heard_at[u] && now - _unit_heard_at[u] < SLIM_AWAKE_MS) continue;
+    owed |= (uint16_t)(1u << u);
+  }
+  if (!owed) return;
+  TeamHeld& t = _team_held[_team_next];
+  _team_next = (uint8_t)((_team_next + 1) % SLIM_TEAM_HELD_MAX);
+  t.owed = owed;
+  t.len = len;
+  memcpy(t.body, body, len);
+  memset(t.seq, 0, sizeof(t.seq));
+  memset(t.tries, 0, sizeof(t.tries));
+  memset(t.sent_at, 0, sizeof(t.sent_at));
+}
+
+void MyMesh::resendTeamText(uint8_t unit, uint8_t which) {
+  if (which >= SLIM_TEAM_HELD_MAX || unit > slim::MAX_ADDR) return;
+  TeamHeld& t = _team_held[which];
+  const uint16_t bit = (uint16_t)(1u << unit);
+  if (!(t.owed & bit)) return;
+  if (t.tries[unit] >= SLIM_HELD_TRIES) {
+    t.owed &= (uint16_t)~bit;
+    return;
+  }
+  slimproto::router().routes.forget(unit);
+  const uint8_t seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
+  if (!sendSlimBurst(slim::TYPE_TEXT, t.body, t.len, unit)) return;
+  t.seq[unit] = seq;
+  t.tries[unit]++;
+  t.sent_at[unit] = _ms->getMillis();
+}
+
+//: [code][unit][key 6][hops][via][snr x4][-rssi][status body]. The body goes
+//: as it came off the air: the app decodes slim_health itself, so a field
+//: added to the format needs nothing here. snr and rssi are how this base
+//: heard the frame; the unit's own readings are inside the body.
+void MyMesh::slimStatusToApp(const slim::Frame& f, const slimproto::Link& link) {
+  const uint8_t* key = slimproto::pubKeyForUnit(f.src);
+  int i = 0;
+  out_frame[i++] = PUSH_CODE_SLIM_STATUS;
+  out_frame[i++] = f.src;
+  if (key) memcpy(&out_frame[i], key, 6);
+  else memset(&out_frame[i], 0, 6);
+  i += 6;
+  out_frame[i++] = f.hops;
+  // The carrier, when it was relayed: a frame sent DIRECT to this base
+  // names the base as its next carrier, which is no path at all.
+  out_frame[i++] = (f.hop != f.src && f.hop != slimproto::unit()) ? f.hop : 0;
+  out_frame[i++] = (uint8_t)link.snr_q4;
+  out_frame[i++] = (uint8_t)(link.rssi < 0 ? (link.rssi < -255 ? 255 : -link.rssi) : 0);
+  const int room = MAX_FRAME_SIZE - i;
+  const int n = f.body_len < room ? f.body_len : room;
+  memcpy(&out_frame[i], f.body, n);
+  _serial->writeFrame(out_frame, i + n);
+}
+
+bool MyMesh::settleTeamText(uint8_t unit, uint8_t seq) {
+  if (unit > slim::MAX_ADDR) return false;
+  const uint16_t bit = (uint16_t)(1u << unit);
+  for (uint8_t w = 0; w < SLIM_TEAM_HELD_MAX; w++) {
+    TeamHeld& t = _team_held[w];
+    // tries, not sent_at: an attempt is stamped when it is owed, before it
+    // has a sequence number to be acknowledged under.
+    if ((t.owed & bit) && t.tries[unit] && t.seq[unit] == seq) {
+      t.owed &= (uint16_t)~bit;
+      return true;
+    }
+  }
+  return false;
+}
+
+//: Tries a held message gets on the clock, as the Pi's OWED_TIMED_TRIES. A
+//: tracker listens between reports (it sniffs, since 2026-10-23), so a try
+//: lost to a collision or a fade goes again once its acknowledgement is
+//: overdue - not minutes later when the unit next reports. The tries when
+//: it is heard stay, for one that really is out of reach.
+static const uint8_t SLIM_HELD_TIMED = 2;
+
+void MyMesh::retryHeldSlimText() {
+  for (uint8_t i = 0; i < SLIM_HELD_MAX; i++) {
+    Held& h = _held[i];
+    if (!h.to || h.timed >= SLIM_HELD_TIMED || h.tries >= SLIM_HELD_TRIES) {
+      continue;
+    }
+    if ((unsigned long)(_ms->getMillis() - h.sent_at) < slimAckWaitMs(h.len)) {
+      continue;
+    }
+    h.timed++;
+    resendHeldSlimText(h.to);               // floods, and stamps the try
+    return;                                 // one thing per pass
+  }
+}
+
+void MyMesh::resendHeldSlimText(uint8_t unit) {
+  for (uint8_t i = 0; i < SLIM_HELD_MAX; i++) {
+    Held& h = _held[i];
+    if (h.to != unit) continue;
+    if (h.tries >= SLIM_HELD_TRIES) {
+      h.to = 0;
+      return;
+    }
+    // The route that did not work is the one thing known to be wrong with
+    // the last attempt, so this one floods - as SlimBridge._resend_owed.
+    slimproto::router().routes.forget(unit);
+    const uint8_t seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
+    if (!sendSlimBurst(slim::TYPE_TEXT, h.body, h.len, unit)) return;
+    h.seq = seq;
+    h.tries++;
+    h.sent_at = _ms->getMillis();
+    return;
+  }
+}
+
+bool MyMesh::settleHeldSlimText(uint8_t unit, uint8_t seq, uint32_t& app_ack) {
+  for (uint8_t i = 0; i < SLIM_HELD_MAX; i++) {
+    Held& h = _held[i];
+    if (h.to != unit) continue;
+    // The latest attempt, or the first - whose id is the app's own. One in
+    // between that lands late is the same words, and the next time the unit
+    // is heard it is simply sent once more.
+    if (seq != h.seq && slimcompanion::ackId(unit, seq) != h.app_ack) {
+      return false;
+    }
+    app_ack = h.app_ack;
+    h.to = 0;
+    return true;
   }
   return false;
 }
@@ -760,8 +1025,20 @@ void MyMesh::sendOwedSlimReplies() {
     const Owed owed = _owed[i];
     _owed[i].to = 0;                        // owed once, whatever happens
     if (owed.type == slim::TYPE_ACK) {
+      // Flooded, not routed. A stored route to the base is often the direct
+      // one, and DIRECT names a single carrier: the repeater ignores it, and
+      // over a marginal direct path it is simply lost. MTRK01 acknowledged
+      // "Test 2" and the Pi never heard it, directly or through MRPT01, and
+      // sent the message again (2026-10-23). Nine bytes, and as far as the
+      // request came: `want` carries the reach, see ackReach.
       sendSlimBurst(slim::TYPE_ACK, &owed.seq, 1, owed.to,
-                    (uint8_t)(1 + getExtraAckTransmitCount()), 2);
+                    (uint8_t)(1 + getExtraAckTransmitCount()),
+                    owed.want ? (int)owed.want : 2,
+                    /*prefer_direct=*/false);
+    } else if (owed.type == slim::TYPE_TEXT) {
+      resendHeldSlimText(owed.to);         // see MyMesh::Held
+    } else if (owed.type == slim::TYPE_GRPTEXT) {
+      resendTeamText(owed.to, (uint8_t)owed.want);   // see MyMesh::TeamHeld
     } else {
       // -1, not a cap. A STATUS teaches routes, so the router refuses to
       // FLOOD one at anything else and throws it away without a word -
@@ -772,7 +1049,8 @@ void MyMesh::sendOwedSlimReplies() {
       // Flooded deliberately: the answer to "can you hear me" has to come
       // back by whatever path works, not by the one this node happens to
       // have stored for the asker.
-      sendSlimStatus(owed.to, owed.want, -1, /*prefer_direct=*/false);
+      sendSlimStatus(owed.to, owed.want, -1, /*prefer_direct=*/false,
+                     &owed.heard);
     }
     return;                                 // one per pass; they are spaced
   }
@@ -783,7 +1061,8 @@ void MyMesh::sendOwedSlimReplies() {
 //: quality byte precisely because battery and fix type ride here instead,
 //: where they are read occasionally rather than paid for continuously.
 void MyMesh::sendSlimStatus(uint8_t to, uint16_t want, int ttl,
-                            bool prefer_direct) {
+                            bool prefer_direct,
+                            const slimproto::Link* heard) {
   slimhealth::Status st;
   if (want & (1u << slimhealth::F_BATT_MV)) {
     st.set(slimhealth::F_BATT_MV, board.getBattMilliVolts());
@@ -791,11 +1070,19 @@ void MyMesh::sendSlimStatus(uint8_t to, uint16_t want, int ttl,
   if (want & (1u << slimhealth::F_UPTIME_MIN)) {
     st.set(slimhealth::F_UPTIME_MIN, (_ms->getMillis() / 1000) / 60);
   }
+  // **The signal of the ping being answered, not of whatever this radio heard
+  // last.** This is the uplink half of a range test, and it exists nowhere
+  // else. The answer waits out the asker's burst first, and in those seconds
+  // a repeater's relay of the same ping, or another unit's report, is the
+  // last thing heard, and the tablet base would report that link as the
+  // handheld's. The Pi's answer has always measured the ping itself.
   if (want & (1u << slimhealth::F_RSSI)) {
-    st.set(slimhealth::F_RSSI, radio_driver.getLastRSSI());
+    st.set(slimhealth::F_RSSI,
+           heard ? heard->rssi : radio_driver.getLastRSSI());
   }
   if (want & (1u << slimhealth::F_SNR)) {
-    st.set(slimhealth::F_SNR, radio_driver.getLastSNR());
+    st.set(slimhealth::F_SNR,
+           heard ? heard->snr_q4 / 4.0f : radio_driver.getLastSNR());
   }
   // Where this unit is in its relationship with the sky. A dot that has
   // stopped is a team resting or a team under canopy whose position is
@@ -883,8 +1170,110 @@ bool MyMesh::sendSlimText(const char* text) {
   uint8_t body[slim::MAX_BODY];
   const int n = slimapp::bodyFor(text, body, sizeof(body));
   if (n < 0) return false;
+#ifdef WITH_TRACKER_MODE
+  // No base on this net, and nobody to answer: to everyone, once - as a pin
+  // goes. There is no unit 15 to wait for, and three tries at one ended
+  // "MSG NOT DELIVERED" while every tracker in range had the message.
+  if (_no_base && !_slim_reply_to) {
+    if (!sendSlimOutgoing(text, slim::TYPE_GRPTEXT, slim::ADDR_BROADCAST,
+                          false)) {
+      return false;
+    }
+    _out.type = 0;
+    _out.sent_only = true;
+    return true;
+  }
+#endif
   const uint8_t to = _slim_reply_to ? _slim_reply_to : slim::ADDR_BASE;
   return sendSlimOutgoing(text, slim::TYPE_TEXT, to, false);
+}
+
+void MyMesh::holdPin() {
+  uint8_t i = 0;
+  while (i < SLIM_PINS_OWED && _pins_owed[i].type) i++;
+  if (i == SLIM_PINS_OWED) {                // full: the oldest goes
+    for (i = 1; i < SLIM_PINS_OWED; i++) _pins_owed[i - 1] = _pins_owed[i];
+    i = SLIM_PINS_OWED - 1;
+  }
+  _out.kept = true;                         // for the screen: held, not lost
+  _pins_owed[i] = _out;
+}
+
+//: Five times round the ladder after the first, then it is let go: the base
+//: heard again and again while a pin still fails means something other than
+//: range, and the airtime belongs to the team.
+static const uint8_t SLIM_PIN_RESUMES = 5;
+
+void MyMesh::resumePin() {
+  if (_out.type || !_pins_owed[0].type) return;   // one thing on the ladder
+  Outgoing pin = _pins_owed[0];
+  for (uint8_t i = 1; i < SLIM_PINS_OWED; i++) _pins_owed[i - 1] = _pins_owed[i];
+  _pins_owed[SLIM_PINS_OWED - 1] = Outgoing();
+  if (pin.resumed >= SLIM_PIN_RESUMES) return;
+  pin.resumed++;
+  pin.tries = 0;
+  pin.acked = false;
+  pin.lost = false;
+  pin.kept = false;
+  pin.due = _ms->getMillis();               // retrySlimOutgoing sends it
+  _out = pin;
+}
+
+uint32_t MyMesh::slimFastWaitMs(uint8_t body_len) {
+  const int frame = body_len + (SLIM_MAX_FRAME - slim::MAX_BODY);
+  return slimproto::fastWaitMs(_radio->getEstAirtimeFor(frame));
+}
+
+void MyMesh::onSlimEcho(const slim::Frame& f) {
+  // The try on the ladder, carried on by a repeater: it got out, so its
+  // answer has a repeater to come back through - wait the full time for it
+  // rather than sending the same words again into a channel already busy
+  // with them.
+  if (_out.type && _out.tries && (uint8_t)(f.seq & 0xFF) == _out.seq) {
+    _out.relayed = true;
+  }
+}
+
+//: **A message waits for nobody's slot** - it goes the moment it is sent,
+//: which is what somebody pressing a button needs. Except for this one
+//: case: another tracker's report starting at that instant, from a unit too
+//: far away to hear. Listening first cannot see that one, and at the base or
+//: the repeater both are lost. So, on rounds - when the base's round-ack has
+//: said who reported last round and how long a slot is - a message that
+//: would overlap one of their reports waits until it is over: a few seconds
+//: at most, and almost never at all. Off rounds there is no schedule to know.
+uint32_t MyMesh::stepAroundMs(uint8_t body_len) {
+#ifdef WITH_TRACKER_MODE
+  const uint32_t now = _ms->getMillis();
+  const uint32_t interval = _tracker.interval();
+  if (!_round_seen || !_round_seen_at || !interval || !_slot_s) return 0;
+  // A round-ack two rounds old says nothing about this one.
+  if ((uint32_t)(now - _round_seen_at) > 2UL * interval * 1000UL) return 0;
+  const uint64_t epoch_ms = _tracker.epochMs(now);
+  if (epoch_ms == 0) return 0;
+  uint8_t role = 0, me = 0;
+  slimcompanion::unitFromCallsign(_prefs.node_name, role, me);
+  const uint32_t mine = _radio->getEstAirtimeFor(
+      body_len + (SLIM_MAX_FRAME - slim::MAX_BODY));
+  const uint32_t report = _radio->getEstAirtimeFor(
+      slimtrack::REPORT_BYTES + (SLIM_MAX_FRAME - slim::MAX_BODY));
+  const uint32_t now_s = (uint32_t)(epoch_ms / 1000ULL);
+  uint64_t clear = epoch_ms;
+  for (uint8_t u = 1; u <= slimround::MAX_UNIT; u++) {
+    if (u == me || !slimround::wasHeard(_round_seen, u)) continue;
+    for (uint8_t k = 0; k < 2; k++) {       // this round's report and the next
+      const uint64_t start =
+          ((uint64_t)slimround::slotStart(now_s, interval, u, _slot_s)
+           + (uint64_t)k * interval) * 1000ULL;
+      const uint64_t end = start + report + slimproto::REPLY_MARGIN_MS;
+      if (clear + mine > start && clear < end) clear = end;
+    }
+  }
+  return (uint32_t)(clear - epoch_ms);
+#else
+  (void)body_len;
+  return 0;
+#endif
 }
 
 bool MyMesh::sendSlimOutgoing(const char* text, uint8_t type, uint8_t to,
@@ -892,52 +1281,103 @@ bool MyMesh::sendSlimOutgoing(const char* text, uint8_t type, uint8_t to,
   uint8_t body[slim::MAX_BODY];
   const int n = slimapp::bodyFor(text, body, sizeof(body));
   if (n < 0) return false;
+  // Not on top of another tracker's report: a moment's hold, and the ladder
+  // sends it - the same path as every retry. Almost always none.
+  const uint32_t hold = stepAroundMs((uint8_t)n);
+  // The first try floods, as the retries always did: this unit is the one
+  // on the move, and the route it learned may be from where it stood
+  // minutes ago. See slim_node.send_text.
+  if (!hold && to && to != slim::ADDR_BROADCAST) {
+    slimproto::router().routes.forget(to);
+  }
   // Taken before the send, because the acknowledgement names it. peek, not
   // a read-back: the frame is built inside sendSlimBurst.
   const uint8_t seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
-  if (!sendSlimBurst(type, body, (uint8_t)n, to)) return false;
+  if (!hold && !sendSlimBurst(type, body, (uint8_t)n, to)) return false;
+  if (!is_marker) saidTo(to);
+  // Whatever is still being tried is kept rather than overwritten - a pin or,
+  // since 2026-10-29, a message. See _pins_owed.
+  if (_out.type) holdPin();
   // Held for the retry ladder. See MyMesh::Outgoing: one attempt is a coin
   // toss over a marginal path, and the screen used to call it "Sent".
   _out = Outgoing();
   strncpy(_out.text, text, sizeof(_out.text) - 1);
   _out.to = to;
   _out.type = type;
-  _out.seq = seq;
-  _out.tries = 1;
   _out.marker = is_marker;
-  _out.due = futureMillis(SLIM_TEXT_ACK_MS);
+  if (hold) {
+    _out.due = futureMillis(hold);          // tries 0: the ladder sends it
+  } else {
+    _out.seq = seq;
+    _out.tries = 1;
+    _out.due = futureMillis(slimAckWaitMs((uint8_t)n));
+    _out.fast_due = futureMillis(slimFastWaitMs((uint8_t)n));
+  }
   return true;
 }
 
 uint8_t MyMesh::textState() const {
   if (_out.type) return 1;                  // waiting
   if (_out.acked) return 2;
-  if (_out.lost) return 3;
+  if (_out.sent_only) return 5;             // no base: sent, nothing to wait for
+  // Given up on here and held for the base, not lost: see _pins_owed.
+  if (_out.lost) return _out.kept ? 4 : 3;
   return 0;
 }
 
 void MyMesh::retrySlimOutgoing() {
-  if (!_out.type || !millisHasNowPassed(_out.due)) return;
+  if (!_out.type) return;
+  // **Nothing heard of it** - no answer, and no repeater carrying it on - by
+  // the time either would have come: it did not get out, so it goes again
+  // now. The full wait allows for an answer coming back through a repeater,
+  // and only a try a repeater was heard carrying is worth all of it. About
+  // 9 s for a short message at SF12 against 21 - and three tries that reach
+  // nobody take half a minute, not a minute, before the message is held.
+  const bool unheard = _out.tries && _out.fast_due && !_out.relayed
+                       && millisHasNowPassed(_out.fast_due);
+  if (!unheard && !millisHasNowPassed(_out.due)) return;
   if (_out.tries >= SLIM_TEXT_TRIES) {
+    holdPin();                      // tried again when the base is heard
     _out.type = 0;
     _out.lost = true;
     if (_ui) _ui->notify(UIEventType::trackerLost);
     return;
   }
-  // Throw the route away first. The one the router prefers is the one with
-  // fewest hops, which on this network is routinely a barely-decodable
-  // direct path - and an addressed DIRECT frame names a single carrier, so
-  // the repeater never gets a copy. Flooding is how it finds the way that
-  // works. See MyMesh::Outgoing.
-  // A broadcast already floods, so there is no route to throw away and
-  // the repeat is the whole of the retry.
-  if (_out.to) slimproto::router().routes.forget(_out.to);
+#ifdef WITH_TRACKER_MODE
+  // Already known to be out of range: one try, then held for the base rather
+  // than retried into nothing. It goes the moment the base is heard.
+  if (_out.tries && _reports.searching()) {
+    holdPin();
+    _out.type = 0;
+    _out.lost = true;
+    return;
+  }
+#endif
   uint8_t body[slim::MAX_BODY];
   const int n = slimapp::bodyFor(_out.text, body, sizeof(body));
   if (n < 0) { _out.type = 0; _out.lost = true; return; }
+  // A retry steps around a report as the first try does.
+  const uint32_t hold = stepAroundMs((uint8_t)n);
+  if (hold) {
+    _out.due = futureMillis(hold);
+    _out.fast_due = 0;
+    return;
+  }
+  // Throw the route away first - for a retry, or a held one going again; the
+  // first try keeps it. The one the router prefers is the one with fewest
+  // hops, which on this network is routinely a barely-decodable direct path
+  // - and an addressed DIRECT frame names a single carrier, so the repeater
+  // never gets a copy. Flooding is how it finds the way that works. See
+  // MyMesh::Outgoing. A broadcast already floods, so there is no route to
+  // throw away and the repeat is the whole of the retry.
+  if (_out.to && (_out.tries || _out.resumed)) {
+    slimproto::router().routes.forget(_out.to);
+  }
   _out.seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
   _out.tries++;
-  _out.due = futureMillis(SLIM_TEXT_ACK_MS);
+  _out.relayed = false;
+  _out.due = futureMillis(slimAckWaitMs((uint8_t)n));
+  _out.fast_due = futureMillis(slimFastWaitMs((uint8_t)n));
   sendSlimBurst(_out.type, body, (uint8_t)n, _out.to);
 }
 
@@ -961,6 +1401,11 @@ bool MyMesh::hereNow(double& lat, double& lon) {
   lon = _trail[0].lon;
   return true;
 }
+
+//: The pin counter, kept across restarts. Creator plus number is a pin's
+//: identity, so a counter that began again at 0 after a reboot sent the
+//: next pin under the first one's identity, and moved that pin.
+static const char* MARKERNUM_FILE = "/markernum";
 
 //: A pin where this unit is standing, for the whole team.
 bool MyMesh::placeMarker(uint8_t icon, const char* label) {
@@ -986,10 +1431,20 @@ bool MyMesh::placeMarker(uint8_t icon, const char* label) {
                         true)) {
     return false;
   }
+#ifdef WITH_TRACKER_MODE
+  // Only a base acknowledges a pin. With none on this net it is sent once,
+  // and the screen says so, rather than tried, held and called undelivered.
+  if (_no_base) {
+    _out.type = 0;
+    _out.sent_only = true;
+  }
+#endif
   // Only once it is actually away. Stepping the counter on a refused
   // send would leave a gap, and the gap is a pin somebody thinks they
   // dropped that nothing anywhere has.
   _marker_num = (uint8_t)((_marker_num + 1) % slimcodec::MARKER_PER_DEVICE);
+  File mf = _store->openWrite(MARKERNUM_FILE);
+  if (mf) { mf.write(&_marker_num, 1); mf.close(); }
   return true;
 }
 #endif
@@ -998,10 +1453,18 @@ bool MyMesh::placeMarker(uint8_t icon, const char* label) {
 //: listening, short enough that somebody switching a unit on at the
 //: vehicle sees it appear before they have walked away.
 static const unsigned long SLIM_ADVERT_FIRST_MS = 15000;
-//: ...and then hourly, which is MeshCore's own advert interval. At about
-//: 53 bytes that is nothing, and it is what lets a base switched on after
-//: the teams still learn every unit without anybody touching them.
-static const unsigned long SLIM_ADVERT_EVERY_MS = 3600000UL;
+//: ...and then every six hours, the repeaters' own rule. It was hourly,
+//: MeshCore's interval: about 4% of an SF12 channel for eight trackers,
+//: telling a base something its reports already prove every few minutes
+//: (2026-10-29). What hourly bought is a base switched on AFTER the teams
+//: learning every unit within the hour; it now takes up to six, or a unit
+//: switched off and on again introduces itself at once. The unit that has
+//: lost the base still says who it is every ten minutes - see below.
+static const unsigned long SLIM_ADVERT_EVERY_MS = 6UL * 3600000UL;
+//: Tries before the next interval: the advert goes again until a base
+//: acknowledges it, three times at most, as a repeater's does. Sent once, an
+//: advert the base missed left it with no contact for this unit for an hour.
+static const uint8_t SLIM_ADVERT_TRIES = 3;
 //: ...but every ten minutes while this unit has lost the base.
 //:
 //: The hourly rate assumes the base already knows this unit. The case
@@ -1033,8 +1496,8 @@ static const char* SLIM_FW = FIRMWARE_VERSION " " __DATE__ " " __TIME__;
 //: Hex rather than packed: it runs at most once an hour and on the
 //: operator pressing Advert, and being able to read one in a log is
 //: worth more than the fifteen bytes packing would save.
-bool MyMesh::sendSlimAdvert() {
-  if (!slimproto::active()) return false;
+uint8_t MyMesh::sendSlimAdvert() {
+  if (!slimproto::active()) return 0;
   // 64 for the key, the rest for "<name> <version>": a 32-char name and
   // a compile stamp both fit, and the length guard below refuses rather
   // than truncating if they ever do not.
@@ -1053,13 +1516,13 @@ bool MyMesh::sendSlimAdvert() {
   const int n = snprintf(text, sizeof(text), "!V%s %s",
                          _prefs.node_name, SLIM_FW);
 #endif
-  if (n < 3 || n + PUB_KEY_SIZE * 2 >= (int)sizeof(text)) return false;
+  if (n < 3 || n + PUB_KEY_SIZE * 2 >= (int)sizeof(text)) return 0;
   mesh::Utils::toHex(&text[n], self_id.pub_key, PUB_KEY_SIZE);
   text[n + PUB_KEY_SIZE * 2] = 0;
 
   uint8_t body[slim::MAX_BODY];
   const int blen = slimapp::bodyFor(text, body, sizeof(body));
-  if (blen < 0) return false;
+  if (blen < 0) return 0;
   return sendSlimBurst(slim::TYPE_GRPTEXT, body, (uint8_t)blen,
                        slim::ADDR_BROADCAST);
 }
@@ -1074,17 +1537,24 @@ bool MyMesh::slimAdvert(const char* msg) {
   if (msg[0] != '!' || msg[1] != 'V') return false;
   const int len = (int)strlen(msg);
   const int hex = PUB_KEY_SIZE * 2;
-  // The key is fixed width and last, so whatever precedes it is the
-  // name - which may be any length and needs no separator.
+  // The key is fixed width and last. Before it comes "<name> <version>":
+  // the name is up to the first space, and the version after it is for
+  // the base's page, not part of the name. Measured on the name alone - a
+  // name carrying its version is thirty-five characters, past the buffer,
+  // and was dropped without a word, so a base never learned a unit that
+  // adverted. A version-less advert has no space, and its whole prefix is
+  // the name, as it always was.
   if (len < 2 + 1 + hex) return true;      // malformed: ours, and dropped
   char name[32];
-  const int nlen = len - 2 - hex;
+  const int prefix = len - 2 - hex;
+  int nlen = 0;
+  while (nlen < prefix && msg[2 + nlen] != ' ') nlen++;
   if (nlen <= 0 || nlen >= (int)sizeof(name)) return true;
   memcpy(name, &msg[2], (size_t)nlen);
   name[nlen] = 0;
 
   uint8_t key[PUB_KEY_SIZE];
-  if (!mesh::Utils::fromHex(key, PUB_KEY_SIZE, &msg[2 + nlen])) return true;
+  if (!mesh::Utils::fromHex(key, PUB_KEY_SIZE, &msg[len - hex])) return true;
 
   // A unit whose name is not a briefing callsign has no unit number,
   // so there is nothing to map it to and nothing that could address
@@ -1144,6 +1614,28 @@ bool MyMesh::slimAdvert(const char* msg) {
 
 void MyMesh::onSlimRecv(const slim::Frame& f,
                         const slimproto::Link& link) {
+  // Everything owed from here on answers this frame, so it waits out the
+  // rest of this frame's burst. See slimproto::replyQuietMs.
+  _owed_quiet = slimproto::replyQuietMs(_radio->getEstAirtimeFor(link.len));
+  handleSlimFrame(f, link);
+  // **A unit transmitting is a unit awake** - so whatever it is owed goes
+  // again now, while it is listening.
+  //
+  // After the frame, not before, as SlimBridge._resend_owed does it. Woken
+  // first, the held copy was owed ahead of the acknowledgement of this very
+  // report, so the base transmitted twice back to back - a three-copy burst
+  // and then the ack - and the unit's own acknowledgement of the copy
+  // landed while the base was still transmitting and deaf. At SF12 that
+  // was every time: on 2026-10-22 MTRK02 showed each team message five
+  // times, once per report, until the tries ran out. Afterwards, an
+  // acknowledgement in this frame has already settled what it answers.
+  wakeHeldSlimText(f.src);
+  // The base is in range again: a pin it never acknowledged goes now.
+  if (f.src == slim::ADDR_BASE) resumePin();
+}
+
+void MyMesh::handleSlimFrame(const slim::Frame& f,
+                             const slimproto::Link& link) {
   // Built once, from the frame and the radio, and handed to every emit
   // below. A trail arrives as two messages and both came off the same
   // transmission, so both must report the same link.
@@ -1163,6 +1655,9 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
   // base neither can reach - which is exactly the pair this feature
   // exists for, both behind the same ridge. A repeated frame is the
   // opposite: something relayed it, so infrastructure is alive.
+  // A frame caught while sniffing leaves the radio in full receive; this
+  // lets the next quiet pass put it back to sniffing.
+  _radio_parked = false;
   trackerHeardSomething(f.type != slim::TYPE_POS || f.hop != f.src);
 #endif
   // A status request, from the base or from anyone holding the operation
@@ -1171,7 +1666,7 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
   // range.
   if (f.type == slim::TYPE_PING) {
     oweSlimReply(f.src, slim::TYPE_STATUS, 0,
-                 slimhealth::wanted(f.body, f.body_len));
+                 slimhealth::wanted(f.body, f.body_len), &link);
     return;
   }
   // The answer to a link test. Only while one is outstanding, and only
@@ -1197,6 +1692,11 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
         _link_test.got_at = _ms->getMillis();
       }
     }
+    // A base hands every other one to the app: the answer to a check or a
+    // Ping, and what units volunteer - a tracker's battery and fix, hourly.
+    // Dropped here until 2026-10-30, so a tablet base showed no tracker
+    // battery and could check no repeater on slim.
+    if (slimproto::unit() == slim::ADDR_BASE) slimStatusToApp(f, link);
     return;
   }
 #ifdef WITH_TRACKER_MODE
@@ -1216,13 +1716,27 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
     // watching for.
     // The base acknowledges a broadcast too - a marker and a position are
     // the same bargain - so the sender matters only for an addressed one.
-    if (_out.type && f.body[0] == _out.seq
+    // A try has to have gone: one still stepping around a report has no
+    // sequence number yet, and 0 would match somebody else's.
+    if (_out.type && _out.tries && f.body[0] == _out.seq
         && (f.src == _out.to || _out.to == slim::ADDR_BROADCAST)) {
       _out.type = 0;
       _out.acked = true;
       if (_ui) _ui->notify(UIEventType::ack);
       return;
     }
+#ifdef WITH_TRACKER_MODE
+    // The base has this unit's advert: stop sending it. See
+    // SLIM_ADVERT_TRIES.
+    if (_slim_advert_tries && f.src == slim::ADDR_BASE
+        && f.body[0] == _slim_advert_seq) {
+      _slim_advert_tries = 0;
+      _slim_advert_at = futureMillis(_reports.searching()
+                                     ? SLIM_ADVERT_LOST_MS
+                                     : SLIM_ADVERT_EVERY_MS);
+      return;
+    }
+#endif
     const uint32_t id = slimcompanion::ackId(f.src, f.body[0]);
 #ifdef WITH_TRACKER_MODE
     // A tracker report, or a piece of the path it kept while it was out
@@ -1234,14 +1748,21 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
       _ack_due = 0;
       if (got == tracker::Reports::REPORT)
         trackerSound(UIEventType::trackerHeard);
-      trackerHistory();
+      _hist_at = futureMillis(TRACKER_HIST_HOLD_MS);   // see trackerHistory
       return;
     }
 #endif
+    // A team message's copy: nobody in the app is waiting on its id.
+    if (settleTeamText(f.src, f.body[0])) return;
+    // A held message, acknowledged under whichever attempt landed and
+    // reported under the id the app was given for the first.
+    uint32_t held_ack;
+    const uint32_t id_for_app =
+        settleHeldSlimText(f.src, f.body[0], held_ack) ? held_ack : id;
     for (int i = 0; i < EXPECTED_ACK_TABLE_SIZE; i++) {
-      if (expected_ack_table[i].ack != id) continue;
+      if (expected_ack_table[i].ack != id_for_app) continue;
       out_frame[0] = PUSH_CODE_SEND_CONFIRMED;
-      memcpy(&out_frame[1], &id, 4);
+      memcpy(&out_frame[1], &id_for_app, 4);
       uint32_t trip = _ms->getMillis() - expected_ack_table[i].msg_sent;
       memcpy(&out_frame[5], &trip, 4);
       _serial->writeFrame(out_frame, 9);
@@ -1257,8 +1778,8 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
   // says that unit number is, so the app threads it against the right contact
   // without ever seeing a unit number.
   if (f.type == slim::TYPE_TEXT) {
-    // Both checks first, and both are pure computation - no I/O, nothing that
-    // delays the reply meaningfully. Acknowledging before them would tell the
+    // Decoded first, and it is pure computation - no I/O, nothing that
+    // delays the reply meaningfully. Acknowledging before it would tell the
     // sender a message landed that we are about to drop, and it would stop
     // retrying: 1 + multi_acks transmissions spent to lose the message twice.
     const uint8_t* pub = slimproto::pubKeyForUnit(f.src);
@@ -1276,38 +1797,52 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
 #ifdef WITH_TRACKER_MODE
     if (!command) command = trackerCommand(msg, from_base);
 #endif
-    // **A message from the base is never dropped for want of a contact.**
+    // **A message is never dropped for want of a contact** - the base's or
+    // anybody's. The operation key authenticated it, so it is acknowledged
+    // and delivered. `pub` is only needed to thread the phone app's copy
+    // against a contact by its key, and a unit whose advert was missed has
+    // none: every unit for the first minutes after a reflash. Dropped here,
+    // a tracker's history went unanswered and was retried for ever - "owed
+    // 13" on the tablet base while the Pi, which goes by unit number, took
+    // the same frames (2026-10-27).
     //
-    // `pub` is only needed to build the phone app's frame, which threads a
-    // message against a contact by its key. A unit that has not yet heard
-    // the base's advert has no key for it - which is every unit for the
-    // first minutes after a reflash, and any unit that missed one advert.
-    //
-    // Dropping the base's words there is the worst failure this radio has:
-    // the operator's screen says sent, the searcher sees nothing, and
-    // nothing anywhere reports it. The base is unit 15 by the briefing
-    // scheme, the same convention that already decides whose commands this
-    // unit obeys, so it is known well enough to acknowledge and to show on
-    // this unit's own screen. Only the phone's copy needs the key.
-    if (pub == NULL && !command && !from_base) return;
-
     // Owed, not sent: see MyMesh::Owed. An acknowledgement transmitted from
     // here goes into the tail of the sender's own burst and is never heard,
-    // whereupon the sender retries a message that did in fact arrive.
-    //
-    // ttl is capped at 2 rather than TTL_INIT so a reply cannot flood the
-    // whole net behind every message. An ACK is the one type the protocol
-    // lets travel short, because it teaches nothing about distance.
-    oweSlimReply(f.src, slim::TYPE_ACK, f.seq, 0);
+    // whereupon the sender retries a message that did in fact arrive. As far
+    // as the request came: see ackReach.
+    oweSlimReply(f.src, slim::TYPE_ACK, f.seq, ackReach(f));
     // Acknowledged, which is the base's confirmation. Not queued: there is no
     // phone to show it to.
     if (command) return;
+    // A retry whose first copy landed, or a held copy of something already
+    // shown: acknowledged again above, shown once. See repeatText.
+    if (repeatText(f.src, msg)) return;
+    // Who to answer. Recorded even with no screen attached, because
+    // the phone may not be the thing that replies.
+    _slim_reply_to = f.src;
+    if (pub == NULL) {
+      // No contact to thread it to, so it reaches the app as team text under
+      // the sender's callsign - which is how that unit's positions already
+      // arrive - and this unit's screen the same way. Built in place over
+      // `msg`, not in another buffer: this is the deepest stack path the
+      // firmware has.
+      char who[16];
+      slimcompanion::callsignFor(f.src, slimcompanion::unitRole(f.src),
+                                 who, sizeof(who));
+      const size_t plen = strlen(who) + 2;
+      size_t keep = (size_t)mlen;
+      if (plen + keep + 1 > sizeof(msg)) keep = sizeof(msg) - plen - 1;
+      memmove(msg + plen, msg, keep);
+      msg[plen + keep] = 0;
+      memcpy(msg, who, plen - 2);
+      msg[plen - 2] = ':';
+      msg[plen - 1] = ' ';
+      emitChannelText(msg, heard);
+      return;
+    }
 
-    // The phone's copy, which is the only part that needs the key. A
-    // message from a sender this unit has no contact for still reaches the
-    // screen below; it simply cannot be threaded in an app that files
-    // everything by key.
-    if (pub != NULL) {
+    // The phone's copy, threaded to the sender's contact.
+    {
       int i = 0;
       if (app_target_ver >= 3) {
         out_frame[i++] = RESP_CODE_CONTACT_MSG_RECV_V3;
@@ -1331,9 +1866,6 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
         _serial->writeFrame(fr, 1);
       }
     }
-    // Who to answer. Recorded even with no screen attached, because
-    // the phone may not be the thing that replies.
-    _slim_reply_to = f.src;
 #ifdef DISPLAY_CLASS
     // ...and onto this unit's own screen. Without this a message
     // arrived, was acknowledged, and was visible only to a phone that
@@ -1368,22 +1900,29 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
     // the Pi - without it the tablet plots everyone perfectly while every
     // tracker in the field quietly concludes it has lost the base.
     if (slimproto::unit() == slim::ADDR_BASE) {
-#ifdef WITH_TRACKER_MODE
-      // Noted for the round-ack, which answers everybody at once. Only a
-      // base that is not running rounds replies to each report - right for
-      // a handful of units, wrong for sixteen.
+      // Noted for the round-ack, which answers everybody at once.
       _round_heard = slimround::withUnit(_round_heard, f.src);
-      if (_round_s == 0)
-#endif
-      {
+      if (_round_s == 0) {
         // Owed, not sent: see MyMesh::Owed. This is the one that matters
         // most - a tracker that never hears its acknowledgement concludes
         // it has lost the base and starts keeping a backlog, in clear
         // line of sight of the antenna.
-        oweSlimReply(f.src, slim::TYPE_ACK, f.seq, 0);
+        oweSlimReply(f.src, slim::TYPE_ACK, f.seq, ackReach(f));
+      } else if (_round_ack_in_ms != 0) {
+        oweSlotAck(f.src, f.seq, ackReach(f));
       }
+      // A round set by hand says nothing of when its relays end, so the
+      // round-ack answers everyone, as rounds always did.
     }
-#ifdef WITH_TRACKER_MODE
+    // **Every slim build reads a trail, not only one that can send them.**
+    // This sat inside WITH_TRACKER_MODE, and SLIM_RAK_4631_base is built
+    // without it - so on the base a trail fell through to formatPosition
+    // below, which read its first six bytes as a position. Those bytes
+    // start with the trail's six bits of form and cadence, so every
+    // tracker was plotted at about 89.3 S. Seen 2026-10-22 on the BLE base:
+    // "MTRK01: !PAAAQD-AL_s_3A" for a unit standing in Frankton. The Pi
+    // asks this question first on every position (slim_node.py), whatever
+    // it was built as, and so does this.
     if (slimtrack::isTrack(f.body, f.body_len)) {
       // A trail: where it is, and where it has been. It goes up as the two
       // messages every base and every phone on this network already reads
@@ -1423,7 +1962,6 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
       }
       return;
     }
-#endif
     // Asked before the position is decoded, not after: by then a no-fix
     // has already become a coordinate, and a coordinate is somewhere.
     if (slimcompanion::isNoFix(f)) {
@@ -1442,7 +1980,7 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
     // and one nine-byte reply is what lets the unit that dropped it try
     // again. Owed rather than sent: see MyMesh::Owed.
     if (slimproto::unit() == slim::ADDR_BASE) {
-      oweSlimReply(f.src, slim::TYPE_ACK, f.seq, 0);
+      oweSlimReply(f.src, slim::TYPE_ACK, f.seq, ackReach(f));
     }
     // Team chat. MeshCore writes "NAME: " into a group body because the packet
     // carries no sender, so the same prefix is rebuilt here from the unit
@@ -1456,6 +1994,29 @@ void MyMesh::onSlimRecv(const slim::Frame& f,
     // the text is dressed as chat, or an advert would appear in the
     // message log as a callsign followed by sixty-four hex digits.
     if (slimAdvert(msg)) return;
+#ifdef WITH_TRACKER_MODE
+    // **A tracker answers the base's team message**, so the base can show
+    // who has it - a pill per tracker, red until it turns green
+    // (2026-10-29). Words only, not the datagrams that share this frame
+    // type. Each unit a moment apart by its number, so seven do not answer
+    // on top of each other; and a copy already shown is answered again,
+    // because the base is asking whether it arrived.
+    if (f.src == slim::ADDR_BASE && msg[0] != '!') {
+      // An acknowledgement and a repeater's copy of it fit in three seconds
+      // at SF12, so each unit's answer has the channel to itself; listening
+      // first sorts out the rest. MTRK07 answers twenty seconds in.
+      const uint32_t TEAM_ACK_STAGGER_MS = 3000;
+      uint8_t role = 0, me = 0;
+      if (slimcompanion::unitFromCallsign(_prefs.node_name, role, me) && me
+          && role == slimcodec::ROLE_TRACKER) {
+        oweSlimReply(slim::ADDR_BASE, slim::TYPE_ACK, f.seq, ackReach(f), NULL,
+                     _owed_quiet + (uint32_t)(me - 1) * TEAM_ACK_STAGGER_MS);
+      }
+    }
+#endif
+    // Words shown once (see repeatText). Datagrams - pins, the team map,
+    // names - are left alone: sending them again is how a late unit gets them.
+    if (msg[0] != '!' && repeatText(f.src, msg)) return;
     tlen = snprintf(text, sizeof(text), "%s: %s", who, msg);
   }
   if (tlen <= 0) return;
@@ -1604,11 +2165,11 @@ void MyMesh::loadSlimUnit() {
   uint8_t role, number;
   if (!slimcompanion::unitFromCallsign(_prefs.node_name, role, number)) return;
   // The base's names carry no number: MSHCMD is unit 15, the base's by
-  // convention, and a base repeats what it hears - which is how a tablet
-  // driving an ordinary tracker build stands in for the Pi on slim.
+  // convention. Whether it repeats what it hears is the build's choice
+  // (MESH_SLIM_FORWARDS), not the name's: the tablet's base sits with the
+  // team, and its relays only doubled what the repeater already carried.
   if (role == slimcodec::ROLE_BASE && number == 0) {
     slimproto::setUnit(slim::ADDR_BASE);
-    slimproto::setForwards(true);
     return;
   }
   if (number >= 1 && number < slim::ADDR_BASE) slimproto::setUnit(number);
@@ -2112,18 +2673,40 @@ void MyMesh::handleCmdFrame(size_t len) {
   // CMD_SEND_SELF_ADVERT now routes to sendSlimAdvert(), the same
   // question the button always asked, answered in the form slim carries.
   //
-  // CMD_SEND_STATUS_REQ is the one that costs a feature. A slim status
-  // exchange exists and the Pi already uses it (slim_health, and
-  // repeater_status_slim on the gateway), so a repeater IS checkable on
-  // slim - just not by a TABLET base, which reaches its node only through
-  // this protocol. Routing it here is what would close that, and it needs
-  // the reply matched back and translated into the status response shape
-  // the app already parses. Named so the gap is a decision rather than a
-  // symptom somebody rediscovers on a hill.
+  // CMD_SEND_STATUS_REQ left the same way on 2026-10-30: a slim PING, as the
+  // Pi's request_status sends, and the STATUS that answers it reaches the app
+  // through slimStatusToApp whenever it comes - there is no MeshCore tag to
+  // match an answer to, so the app matches it by unit. That closed the one
+  // gap a tablet base had against a Pi: repeater checks, and Ping, on slim.
+  if (slimproto::active() && cmd_frame[0] == CMD_SEND_STATUS_REQ) {
+    const uint8_t unit = len >= 1 + 6 ? slimproto::unitForPubKey(&cmd_frame[1], 6)
+                                      : slimproto::NO_UNIT;
+    if (unit == slimproto::NO_UNIT || unit == slimproto::unit()) {
+      writeErrFrame(ERR_CODE_NOT_FOUND);
+      return;
+    }
+    const uint8_t seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
+    // Flooded, with no body - every field the unit has. A route names one
+    // carrier, and the answer has to come back by whatever path works; see
+    // sendLinkTest.
+    static const uint8_t everything[1] = {0};
+    if (!sendSlimBurst(slim::TYPE_PING, everything, 0, unit, 0, -1,
+                       /*prefer_direct=*/false)) {
+      writeErrFrame(ERR_CODE_TABLE_FULL);
+      return;
+    }
+    const uint32_t tag = slimcompanion::ackId(unit, seq);
+    const uint32_t wait = slimAckWaitMs(0);
+    out_frame[0] = RESP_CODE_SENT;
+    out_frame[1] = 1;                                   // flooded
+    memcpy(&out_frame[2], &tag, 4);
+    memcpy(&out_frame[6], &wait, 4);
+    _serial->writeFrame(out_frame, 10);
+    return;
+  }
   if (slimproto::active()) {
     switch (cmd_frame[0]) {
       case CMD_SEND_LOGIN:
-      case CMD_SEND_STATUS_REQ:
       case CMD_SEND_TELEMETRY_REQ:
       case CMD_SEND_BINARY_REQ:
       case CMD_SEND_ANON_REQ:
@@ -2133,6 +2716,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       case CMD_SEND_RAW_PACKET:
       case CMD_SEND_CONTROL_DATA:
       case CMD_SEND_CHANNEL_DATA:
+      case CMD_SHARE_CONTACT:             // a MeshCore advert, sent on our behalf
         writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
         return;
       default:
@@ -2208,13 +2792,21 @@ void MyMesh::handleCmdFrame(size_t len) {
       // The app addresses a contact by the first 6 bytes of its public key.
       // The wire addresses it by a 4-bit unit number. The map between them is
       // local and costs nothing on air, so neither side has to change.
-      const uint8_t* prefix = &cmd_frame[8];       // after type, attempt, ts
+      //
+      // [cmd][txt_type][attempt][ts x4][key x6][text] - the same layout the
+      // stock path below reads, so the key is at 7 and the text at 13. This
+      // read 8 and 14 from the first slim commit: every lookup was the key
+      // shifted by a byte plus the first letter of the message, matched no
+      // unit, and was refused. A Pi never noticed - its slim path is Python
+      // - but a tablet base on slim could not send a single direct message,
+      // a ping included. Seen 2026-10-22: "the node refused that message".
+      const uint8_t* prefix = &cmd_frame[7];
       const uint8_t unit = slimproto::unitForPubKey(prefix, 6);
       if (unit == slimproto::NO_UNIT) {
         writeErrFrame(ERR_CODE_NOT_FOUND);         // not on the briefing roster
         return;
       }
-      char* text = (char*)&cmd_frame[14];
+      char* text = (char*)&cmd_frame[13];
       cmd_frame[len] = 0;                          // ensure null
       uint8_t body[slim::MAX_BODY];
       const int blen = slimapp::bodyFor(text, body, sizeof(body));
@@ -2222,6 +2814,11 @@ void MyMesh::handleCmdFrame(size_t len) {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);       // too long for one frame
         return;
       }
+      // **The first try floods**, as every retry already did - see
+      // slim_node.send_text. A route is learned from the unit's last frame,
+      // and a tracker on the move has usually left it: DIRECT names one
+      // carrier and no repeater may help it.
+      slimproto::router().routes.forget(unit);
       // The sequence number the frame will carry, known before it is built
       // because the router hands them out in order.
       const uint8_t seq = (uint8_t)((slimproto::router().peekNextSeq()) & 0xFF);
@@ -2236,6 +2833,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       expected_ack_table[next_ack_idx].ack = expected_ack;
       expected_ack_table[next_ack_idx].contact = lookupContactByPubKey(prefix, 6);
       next_ack_idx = (next_ack_idx + 1) % EXPECTED_ACK_TABLE_SIZE;
+      // ...and kept, for a unit that is asleep right now. See MyMesh::Held.
+      holdSlimText(unit, seq, expected_ack, body, (uint8_t)blen);
+      saidTo(unit);
 
       uint32_t est_timeout = 8000;
       out_frame[0] = RESP_CODE_SENT;
@@ -2333,6 +2933,15 @@ void MyMesh::handleCmdFrame(size_t len) {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);        // too long for one frame
       } else if (sendSlimBurst(type, body, (uint8_t)blen,
                                slim::ADDR_BROADCAST)) {
+        // Somebody's words, kept for the trackers asleep right now. Not the
+        // protocol traffic that shares this path - the team map, markers,
+        // names - which is re-sent on its own schedule and would arrive on
+        // a tracker's screen as gibberish. See MyMesh::TeamHeld.
+        if (type == slim::TYPE_GRPTEXT
+            && slimcompanion::skipSenderPrefix(text)[0] != '!') {
+          holdTeamText(body, (uint8_t)blen);
+          saidTo(slim::ADDR_BROADCAST);
+        }
         writeOKFrame();
       } else {
         writeErrFrame(ERR_CODE_TABLE_FULL);
@@ -3023,6 +3632,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     // variables - the official one does - can read and set it unchanged.
     if (dp > (char *)&out_frame[1]) *dp++ = ',';
     dp += sprintf(dp, "tracker:%lu", (unsigned long)_tracker.interval());
+    dp += sprintf(dp, ",nobase:%d", _no_base ? 1 : 0);
 #endif
 #ifdef WITH_MESH_SLIM
     // What has been heard, and what became of it. Beside `proto` because
@@ -3038,10 +3648,13 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
     // The protocol this node is on, for an app that drives it as a base: the
     // tablet reads it here and moves it with "proto:1" / "proto:0".
-    if (slimproto::canSwitch()) {
-      if (dp > (char *)&out_frame[1]) *dp++ = ',';
-      dp += sprintf(dp, "proto:%d", slimproto::active() ? 1 : 0);
-    }
+    //
+    // Listed on a slim-only build too, where it can only say 1. It was
+    // listed only when the build could switch, and an app that finds no
+    // "proto" decides the node is MeshCore - so a slim-only base would
+    // have been driven as one (2026-10-23). Moving it is still refused.
+    if (dp > (char *)&out_frame[1]) *dp++ = ',';
+    dp += sprintf(dp, "proto:%d", slimproto::active() ? 1 : 0);
 #endif
     _serial->writeFrame(out_frame, dp - (char *)out_frame);
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR && len >= 4) {
@@ -3069,11 +3682,28 @@ void MyMesh::handleCmdFrame(size_t len) {
         }
         return;
       }
-#endif
-#ifdef WITH_TRACKER_MODE
+      // The base's rounds and its clock, from the app driving it. An app
+      // that gets an error for either is talking to a node built before
+      // 2026-10-29, which runs no rounds: it says so rather than guessing.
       if (strcmp(sp, "round") == 0) {
         if (setRound(np)) writeOKFrame();
         else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        return;
+      }
+      if (strcmp(sp, "clock") == 0) {
+        if (setClockMs(np)) writeOKFrame();
+        else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        return;
+      }
+#endif
+#ifdef WITH_TRACKER_MODE
+      if (strcmp(sp, "nobase") == 0) {
+        if ((np[0] == '0' || np[0] == '1') && np[1] == 0) {
+          setNoBase(np[0] == '1');
+          writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
         return;
       }
       if (strcmp(sp, "tracker") == 0) {
@@ -3500,7 +4130,7 @@ void MyMesh::checkSerialInterface() {
 }
 
 void MyMesh::loop() {
-#ifdef WITH_TRACKER_MODE
+#ifdef WITH_MESH_SLIM
   // The base's one frame per round. Cheap to ask: it returns immediately
   // unless this node is a base running rounds and the moment has come.
   roundLoop();
@@ -3511,24 +4141,47 @@ void MyMesh::loop() {
   sendOwedSlimReplies();
   // ...and the message or marker somebody is standing there watching for.
   retrySlimOutgoing();
+  // ...and, on a base, a message to a unit whose acknowledgement is overdue.
+  retryHeldSlimText();
   // Who this unit is, to anyone who has not heard of it. See
   // _slim_advert_at for why it repeats.
   if (_slim_advert_at && millisHasNowPassed(_slim_advert_at)
       && slimproto::active()) {
-    sendSlimAdvert();
+#ifdef WITH_TRACKER_MODE
+    // Taken before the send, because a base's acknowledgement names it.
+    _slim_advert_seq = (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
+#endif
+    const uint32_t air = _radio->getEstAirtimeFor(sendSlimAdvert());
+    bool first = true;
 #ifdef WITH_TRACKER_MODE
     // Sooner if nothing is hearing this unit - see SLIM_ADVERT_LOST_MS.
     _slim_advert_at = futureMillis(_reports.searching()
                                    ? SLIM_ADVERT_LOST_MS
                                    : SLIM_ADVERT_EVERY_MS);
+    // Again soon if no base acknowledges it - see SLIM_ADVERT_TRIES. Not
+    // with no base on the net, where nothing ever would.
+    first = _slim_advert_tries == 0;
+    if (!_no_base && ++_slim_advert_tries < SLIM_ADVERT_TRIES) {
+      _slim_advert_at = futureMillis(slimproto::ackWaitMs(air));
+    } else {
+      _slim_advert_tries = 0;
+    }
 #else
     _slim_advert_at = futureMillis(SLIM_ADVERT_EVERY_MS);
 #endif
-    // ...and how it is, ten seconds later. Broadcast rather than asked
-    // for: a request needs the base to reach the unit and its answer to
-    // come back, and a tracker whose battery cannot be read is one whose
-    // dot stops for a reason nobody can see.
-    _slim_status_at = futureMillis(10000);
+    // ...and how it is, once the advert and the base's answer to it are
+    // both over: the advert, the base's hold-off, an answer no longer than
+    // the advert, and a second spare - as the repeater does. Broadcast
+    // rather than asked for: a request needs the base to reach the unit and
+    // its answer to come back, and a tracker whose battery cannot be read is
+    // one whose dot stops for a reason nobody can see. A fixed ten seconds
+    // was behind three copies of the advert; behind one, it landed on the
+    // base's acknowledgement of it. Once per round of adverts: a retry is
+    // about the advert, not the battery.
+    if (first) {
+      _slim_status_at = futureMillis(air + slimproto::peerQuietMs(air) + air
+                                     + 1000);
+    }
   }
   if (_slim_status_at && millisHasNowPassed(_slim_status_at)
       && slimproto::active()) {
@@ -3549,7 +4202,8 @@ void MyMesh::loop() {
 #endif
 #ifdef WITH_TRACKER_MODE
   // The radio is parked between reports: nothing below has anything to hear,
-  // and running the mesh loop would wake the radio to listen.
+  // and running the mesh loop would wake the radio to listen. A packet the
+  // sniffing radio caught un-parks it, so this loop reads it at once.
   if (trackerLoop()) return;
 #endif
   BaseChatMesh::loop();
@@ -3572,6 +4226,13 @@ void MyMesh::loop() {
 }
 
 bool MyMesh::advert() {
+#ifdef WITH_MESH_SLIM
+  // The screen's "Advert" button. On slim it built a MeshCore advert, which
+  // no slim receiver can read - so pressing it on a tracker the base had not
+  // yet heard of said "Advert sent!" and taught the base nothing. The same
+  // question CMD_SEND_SELF_ADVERT answers, answered the same way.
+  if (slimproto::active()) return sendSlimAdvert();
+#endif
   mesh::Packet* pkt;
   if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
     pkt = createSelfAdvert(_prefs.node_name);
@@ -3601,6 +4262,24 @@ bool MyMesh::hasPendingWork() const {
 // and the radio to match the phase, and send when the schedule says so.
 
 static const char* TRACKER_FILE = "/tracker";
+static const char* NOBASE_FILE = "/nobase";
+
+bool MyMesh::setNoBase(bool on) {
+  _no_base = on;
+  // What was being kept for a base is dropped with the base: nothing will
+  // ever acknowledge it, and "kept 13" on a net without one only confuses.
+  _reports = tracker::Reports();
+  _ack_due = 0;
+  _hist_at = 0;
+  for (uint8_t i = 0; i < SLIM_PINS_OWED; i++) _pins_owed[i] = Outgoing();
+  if (on) {
+    File f = _store->openWrite(NOBASE_FILE);
+    if (f) { const uint8_t one = 1; f.write(&one, 1); f.close(); }
+  } else {
+    _store->removeFile(NOBASE_FILE);
+  }
+  return true;
+}
 
 //: The longest find mode anyone can ask for. Half an hour is the usual one;
 //: three hours is a lost dog at dusk, and beyond that a tracker reporting
@@ -3612,6 +4291,12 @@ static const uint32_t FIND_MAX_MINUTES = 180;
 //: otherwise pay the whole flood timeout for an ack that is not coming.
 static uint32_t trackerAckWait(uint32_t est_timeout) {
   return est_timeout < 20000 ? est_timeout : 20000;
+}
+
+void MyMesh::trackerSent(const tracker::Fix& fix, uint8_t seq) {
+  if (_no_base) return;          // a broadcast, and nobody to answer it
+  _reports.sent(fix, slimcompanion::ackId(slim::ADDR_BASE, seq));
+  _ack_due = _ms->getMillis() + trackerAckWait(0);
 }
 
 bool MyMesh::hasGps() {
@@ -3688,10 +4373,13 @@ void MyMesh::pushSample(double lat, double lon) {
 
 bool MyMesh::sendTrackerTrail() {
   if (!slimproto::active() || _trail_n == 0 || !_trail[0].fix) return false;
-  uint8_t body[slimtrack::BODY_BYTES];
-  const int n = slimtrack::encode(_trail, _trail_n,
-                                  _tracker.sampleCadence(), body,
-                                  sizeof(body));
+  // The compact form: a 17-byte frame where the long one was 22, a quarter of
+  // a second less on the air at SF12 for this and every relay of it. Every
+  // base reads both. See slimtrack::encodeCompact.
+  uint8_t body[slimtrack::REPORT_BYTES];
+  const int n = slimtrack::encodeCompact(_trail, _trail_n,
+                                         _tracker.sampleCadence(), body,
+                                         sizeof(body));
   if (n < 0) return false;
   const tracker::Fix fix = {(float)_trail[0].lat, (float)_trail[0].lon,
                             _ms->getMillis() / 1000};
@@ -3704,8 +4392,7 @@ bool MyMesh::sendTrackerTrail() {
   // The backlog keeps the newest place only: a gap is recovered as "!H"
   // messages, which carry their own times and do not need the trail's
   // cadence to make sense of them.
-  _reports.sent(fix, slimcompanion::ackId(slim::ADDR_BASE, seq));
-  _ack_due = _ms->getMillis() + trackerAckWait(0);
+  trackerSent(fix, seq);
   return true;
 }
 
@@ -3726,8 +4413,7 @@ bool MyMesh::sendTrackerNoFix() {
   // Kept on the same list as any other report. A unit under canopy that is
   // also out of radio contact still has a gap to hand over later, and its
   // no-fix reports are part of what the base did not hear.
-  _reports.sent(fix, slimcompanion::ackId(slim::ADDR_BASE, seq));
-  _ack_due = _ms->getMillis() + trackerAckWait(0);
+  trackerSent(fix, seq);
   return true;
 }
 
@@ -3751,7 +4437,20 @@ bool MyMesh::applyTrackerInterval(uint32_t interval_s) {
 }
 
 void MyMesh::loadTrackerMode() {
-  uint32_t secs = 0;
+  File nb = _store->openRead(NOBASE_FILE);
+  if (nb) { _no_base = true; nb.close(); }
+  File mf = _store->openRead(MARKERNUM_FILE);
+  if (mf) {
+    uint8_t n = 0;
+    if (mf.read(&n, 1) == 1 && n < slimcodec::MARKER_PER_DEVICE) _marker_num = n;
+    mf.close();
+  }
+  // TRACKER_DEFAULT_S until somebody chooses. A handheld that has never been
+  // told anything - every unit after an erase - comes up tracking, rather
+  // than sitting silent in a searcher's pack until the base sends "!T". A
+  // saved choice, "off" included, always wins: this is read only when there
+  // is no file at all.
+  uint32_t secs = TRACKER_DEFAULT_S;
   File f = _store->openRead(TRACKER_FILE);
   if (f) {
     if (f.read((uint8_t*)&secs, sizeof(secs)) != sizeof(secs)) secs = 0;
@@ -3815,7 +4514,8 @@ void MyMesh::applyTrackerSlot() {
   _tracker.setSlot(unit, _slot_s, lead);
   // As many places as the interval actually has room for. Padding it with
   // samples never taken is how a trail grows places a team never stood.
-  _tracker.setSamples(slimtrack::samplesFor(interval, TRACKER_SAMPLE_S),
+  _tracker.setSamples(slimtrack::samplesFor(interval, TRACKER_SAMPLE_S,
+                                            slimtrack::REPORT_SAMPLES),
                       TRACKER_SAMPLE_S);
 }
 
@@ -3824,60 +4524,12 @@ void MyMesh::applyTrackerSlot() {
 //:
 //: The time is why a unit that has never had a GPS fix can still hold a
 //: slot, and the reason this is not simply a bitmap.
-//: "300,7": a five-minute round of seven-second slots. Refused rather
-//: than trimmed when the slots would not fit - overlapping slots are worse
-//: than none, because every unit believes it owns a moment and some of
-//: them are wrong.
-bool MyMesh::setRound(const char* spec) {
-  if (spec == NULL) return false;
-  if (*spec == 0 || strcmp(spec, "0") == 0) {
-    _round_s = 0;
-    _round_slot_s = 0;
-    return true;
-  }
-  char* end;
-  const unsigned long round = strtoul(spec, &end, 10);
-  if (end == spec || *end != ',') return false;
-  const char* np = end + 1;
-  const unsigned long slot = strtoul(np, &end, 10);
-  if (end == np || *end != 0) return false;
-  if (slot < slimround::MIN_SLOT_S || slot > slimround::MAX_SLOT_S) return false;
-  if (!slimround::slotsFit((uint32_t)round, (uint8_t)slot)) return false;
-  _round_s = (uint32_t)round;
-  _round_slot_s = (uint8_t)slot;
-  _round_heard = 0;
-  _round_ack_at = 0;
-  return true;
-}
-
-void MyMesh::roundLoop() {
-  if (_round_s == 0 || _round_slot_s == 0) return;
-  if (!slimproto::active()) return;
-  if (slimproto::unit() != slim::ADDR_BASE) return;  // the base only
-  // The RTC, which the app sets when it connects. A base is attached to a
-  // tablet with a clock in it; a tracker has a GPS. Both are real time,
-  // which is all a slot needs.
-  const uint32_t epoch = getRTCClock()->getCurrentTime();
-  if (epoch < 1600000000UL) return;                  // no clock yet
-  const uint32_t at = epoch - (epoch % _round_s)
-                      + slimround::baseSlot(_round_s, _round_slot_s);
-  if (epoch < at || _round_ack_at == at) return;
-  _round_ack_at = at;
-  slimround::Ack a;
-  a.epoch = epoch;
-  a.slot_s = _round_slot_s;
-  a.heard = _round_heard;
-  _round_heard = 0;
-  uint8_t body[slimround::ACK_BYTES];
-  if (slimround::encodeAck(a, body, sizeof(body)) < 0) return;
-  sendSlimBurst(slim::TYPE_ROSTER, body, slimround::ACK_BYTES,
-                slim::ADDR_BROADCAST, 1);
-}
-
 void MyMesh::onRoundAck(const slim::Frame& f) {
   slimround::Ack a;
   if (!slimround::decodeAck(f.body, f.body_len, a)) return;
   _slot_s = a.slot_s;
+  _round_seen = a.heard;                  // whose reports a message steps around
+  _round_seen_at = _ms->getMillis();
   if (a.epoch != 0) _tracker.setClock(a.epoch, _ms->getMillis());
   applyTrackerSlot();
   uint8_t role = 0, unit = 0;
@@ -3891,7 +4543,7 @@ void MyMesh::onRoundAck(const slim::Frame& f) {
     _ack_due = 0;
     if (heard_in_round == tracker::Reports::REPORT)
       trackerSound(UIEventType::trackerHeard);
-    trackerHistory();
+    _hist_at = futureMillis(TRACKER_HIST_HOLD_MS);
   }
 }
 
@@ -3949,8 +4601,7 @@ bool MyMesh::sendTrackerFix(double lat, double lon) {
       _reports.unsent(fix);
       return false;
     }
-    _reports.sent(fix, slimcompanion::ackId(slim::ADDR_BASE, seq));
-    _ack_due = _ms->getMillis() + trackerAckWait(0);
+    trackerSent(fix, seq);
     return true;
   }
 
@@ -4012,8 +4663,15 @@ void MyMesh::trackerHistory() {
     // "!H" is base64url and the text tier is capital letters only, so it
     // rides as an app datagram - see SlimApp.h. Without that it would
     // arrive uppercased, decode, and put the team somewhere else.
+    //
+    // Flooded, not sent down the route: a route to the base names a single
+    // next hop, often the base itself, and on 2026-10-31 pieces sent that way
+    // were lost on a moving unit while its reports arrived by three paths.
     char h[slimcodec::HIST_MAX_TEXT + 1];
-    const uint8_t hn = _reports.nextHistory(h, _ms->getMillis() / 1000);
+    const uint32_t ms = _ms->getMillis();
+    const uint8_t hn = _reports.nextHistory(
+        h, ms / 1000, _tracker.hasClock() ? _tracker.epoch(ms) : 0,
+        slimcodec::HIST_SLIM_POINTS);
     if (hn == 0) return;
     uint8_t body[slim::MAX_BODY];
     const int blen = slimapp::bodyFor(h, body, sizeof(body));
@@ -4021,7 +4679,7 @@ void MyMesh::trackerHistory() {
     const uint8_t seq =
         (uint8_t)(slimproto::router().peekNextSeq() & 0xFF);
     if (!sendSlimBurst(slim::TYPE_TEXT, body, (uint8_t)blen,
-                       slim::ADDR_BASE)) {
+                       slim::ADDR_BASE, 0, -1, /*prefer_direct=*/false)) {
       return;   // still owed; it goes after the next confirmed report
     }
     _reports.historySent(slimcompanion::ackId(slim::ADDR_BASE, seq), hn);
@@ -4135,10 +4793,29 @@ bool MyMesh::trackerLoop() {
   // opposite is the worst of the three states to be in, because the operator
   // re-sends a setting that was never wrong.
   owing = owedSlimReply();
+  // The path kept while out of range, once the relays of the report and of
+  // its acknowledgement are off the air. Sent the instant the ack landed, it
+  // went out on top of them: the base relays every report it hears and the
+  // repeater relays both, so the base was transmitting and never heard it -
+  // "owed 13" in range, with every report acknowledged (2026-10-24).
+  if (_hist_at && millisHasNowPassed(_hist_at)) {
+    _hist_at = 0;
+    trackerHistory();
+  }
 #endif
-  const bool quiet = _mgr->getOutboundTotal() == 0 && !acking && !testing
-                     && !owing;
+  // isTransmitting too: the packet on the air has already left the queue.
+  // Without it a tracker outside its listen window parked the radio in the
+  // middle of its own 5.9 s advert - no tracker advert ever arrived, at boot
+  // or pressed by hand, and an erased base never learned who they were
+  // (2026-10-23). Reports escaped because they are sent in LISTEN.
+  const bool quiet = _mgr->getOutboundTotal() == 0 && !isTransmitting()
+                     && !acking && !testing && !owing && !_hist_at;
   const bool have_fix = _fixes >= tracker::FIX_SETTLE;
+  // Hunting means the last report said "no fix" and the GPS has stayed on
+  // looking for the sky. The moment it is found, it goes - not at the next
+  // slot, up to a whole interval later, with the base showing NO GPS FIX
+  // for a unit that knows exactly where it is.
+  if (_gps_hunting && have_fix) _tracker.reportNow(now);
   const tracker::Schedule::Action act = _tracker.tick(now, have_fix, quiet);
   if (act == tracker::Schedule::SAMPLE) {
     // A place between reports. Nothing goes on the air - it waits for the
@@ -4193,10 +4870,25 @@ bool MyMesh::trackerLoop() {
     // The processor sleeps through all of it either way. What this costs
     // is about an eighth of listening properly, and it is only paid by
     // the units that are actually lost.
-    if (!(_reports.searching() && radio_driver.startSniffing())) {
+    // Sniffing, not asleep, between reports - in contact or not. Asleep, a
+    // message from the base waited up to a whole interval for the next report
+    // (2026-10-23); sniffing, it lands in seconds, for about an eighth of the
+    // current of listening properly.
+    if (!radio_driver.startSniffing()) {
       radio_driver.sleepWarm();
     }
     _radio_parked = true;
+  }
+  // **What the sniffing radio caught is read now, not at the next wake.** The
+  // chip holds a packet it has heard and stops listening until it is read,
+  // and the mesh loop - skipped while parked - is the only reader. So a
+  // message from the base sat in the radio until the next report or button
+  // press, and everything sent after it went unheard: team messages were
+  // answered three minutes late and texts "only appeared after I pressed
+  // send" (2026-10-29). Read, it goes back to sniffing on the next quiet pass.
+  if (radio_driver.packetWaiting()) {
+    _radio_parked = false;
+    return false;
   }
   // Short slices rather than one long sleep: a phone that connects is answered
   // within a second, and a serial GPS cannot overflow its buffer while it looks
@@ -4215,3 +4907,126 @@ bool MyMesh::trackerLoop() {
 }
 
 #endif  // WITH_TRACKER_MODE
+
+#ifdef WITH_MESH_SLIM
+// ---- the base's side of a round ------------------------------------------
+//
+// Here rather than with tracker mode: the base is the side that runs a
+// round, and the tablet's node is built without tracker mode. It ran no
+// rounds at all until 2026-10-29 for exactly that reason.
+
+//: "180,21,7,12300": a three-minute round of 21-second slots for trackers
+//: 1-7, each acknowledged 12.3 s into its own slot. "300,7": a round set
+//: by hand, which the round-ack alone answers. Refused rather than trimmed
+//: when the slots would not fit - overlapping slots are worse than none,
+//: because every unit believes it owns a moment and some of them are wrong.
+bool MyMesh::setRound(const char* spec) {
+  if (spec == NULL) return false;
+  if (*spec == 0 || strcmp(spec, "0") == 0) {
+    _round_s = 0;
+    _round_slot_s = 0;
+    _round_units = slimround::MAX_UNIT;
+    _round_ack_in_ms = 0;
+    return true;
+  }
+  unsigned long v[4] = {0, 0, 0, 0};
+  const char* p = spec;
+  uint8_t n = 0;
+  for (;;) {
+    char* end;
+    v[n] = strtoul(p, &end, 10);
+    if (end == p) return false;
+    n++;
+    if (*end == 0) break;
+    if (*end != ',' || n == 4) return false;
+    p = end + 1;
+  }
+  if (n != 2 && n != 4) return false;
+  const unsigned long round = v[0], slot = v[1];
+  if (slot < slimround::MIN_SLOT_S || slot > slimround::MAX_SLOT_S) return false;
+  unsigned long units = slimround::MAX_UNIT, ack_ms = 0;
+  if (n == 4) {
+    // Planned by the app, from the airtime and the relays it knows about.
+    // Checked here only for being a round at all: every slot inside it,
+    // and each acknowledgement inside its own slot.
+    units = v[2];
+    ack_ms = v[3];
+    if (units < 1 || units > slimround::MAX_UNIT) return false;
+    if (units * slot >= round) return false;
+    if (ack_ms == 0 || ack_ms >= slot * 1000UL) return false;
+  } else if (!slimround::slotsFit((uint32_t)round, (uint8_t)slot)) {
+    return false;
+  }
+  // The app sends its round on every connect. The same round again is not
+  // a new one: who has been heard so far, and whether this round's ack has
+  // gone, still stand.
+  if (_round_s == round && _round_slot_s == slot && _round_units == units
+      && _round_ack_in_ms == ack_ms) {
+    return true;
+  }
+  _round_s = (uint32_t)round;
+  _round_slot_s = (uint8_t)slot;
+  _round_units = (uint8_t)units;
+  _round_ack_in_ms = (uint32_t)ack_ms;
+  _round_heard = 0;
+  _round_ack_at = 0;
+  return true;
+}
+
+void MyMesh::roundLoop() {
+  if (_round_s == 0 || _round_slot_s == 0) return;
+  if (!slimproto::active()) return;
+  if (slimproto::unit() != slim::ADDR_BASE) return;  // the base only
+  // Real time, which is all a slot needs: the tablet's GNSS clock through
+  // `clock`, or the RTC the app sets when it connects.
+  const uint32_t epoch = (uint32_t)(epochMs() / 1000ULL);
+  if (epoch < 1600000000UL) return;                  // no clock yet
+  // Straight after the last slot in use, not after sixteen: a round for
+  // seven trackers would otherwise ack into its own next round.
+  const uint32_t at = epoch - (epoch % _round_s)
+                      + slimround::baseSlot(_round_s, _round_slot_s, _round_units);
+  if (epoch < at || _round_ack_at == at) return;
+  _round_ack_at = at;
+  slimround::Ack a;
+  a.epoch = epoch;
+  a.slot_s = _round_slot_s;
+  a.heard = _round_heard;
+  _round_heard = 0;
+  uint8_t body[slimround::ACK_BYTES];
+  if (slimround::encodeAck(a, body, sizeof(body)) < 0) return;
+  sendSlimBurst(slim::TYPE_ROSTER, body, slimround::ACK_BYTES,
+                slim::ADDR_BROADCAST, 1);
+}
+
+void MyMesh::oweSlotAck(uint8_t unit, uint8_t seq, uint16_t want) {
+  const uint64_t now = epochMs();
+  uint64_t wait = 0;
+  if (now >= 1600000000000ULL) {
+    const uint64_t start = (uint64_t)slimround::slotStart(
+        (uint32_t)(now / 1000ULL), _round_s, unit, _round_slot_s) * 1000ULL;
+    const uint64_t due = start + _round_ack_in_ms;
+    if (due > now && due - now <= (uint64_t)_round_slot_s * 1000ULL) {
+      wait = due - now;
+    }
+  }
+  // Zero - outside its slot, a unit still free-running or a copy relayed
+  // late - is answered after the usual turnaround, as without rounds.
+  oweSlimReply(unit, slim::TYPE_ACK, seq, want, NULL, (uint32_t)wait);
+}
+
+bool MyMesh::setClockMs(const char* spec) {
+  if (spec == NULL) return false;
+  char* end;
+  const unsigned long long ms = strtoull(spec, &end, 10);
+  if (end == spec || *end != 0 || ms < 1600000000000ULL) return false;
+  _clock_ms = (uint64_t)ms;
+  _clock_millis = _ms->getMillis();
+  getRTCClock()->setCurrentTime((uint32_t)(ms / 1000ULL));
+  return true;
+}
+
+uint64_t MyMesh::epochMs() {
+  if (_clock_ms == 0) return (uint64_t)getRTCClock()->getCurrentTime() * 1000ULL;
+  return _clock_ms + (unsigned long)(_ms->getMillis() - _clock_millis);
+}
+#endif  // WITH_MESH_SLIM

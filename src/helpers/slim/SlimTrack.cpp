@@ -8,6 +8,7 @@ namespace slimtrack {
 
 const uint16_t CADENCES[16] = {60, 30, 15, 20, 45, 90, 120, 150, 180, 240,
                                300, 600, 900, 1800, 10, 5};
+const double COMPACT_STEPS_M[4] = {5.0, 20.0, 80.0, 320.0};
 
 //: Metres per degree of latitude, as slim_position.py has it. Close enough
 //: everywhere: the error against a geodesic is far under the five-metre step.
@@ -41,14 +42,14 @@ uint8_t cadenceIndex(uint16_t seconds) {
 }
 
 bool isTrack(const uint8_t* body, uint8_t len) {
-  return body != 0 && len == BODY_BYTES;
+  return body != 0 && (len == BODY_BYTES || len == COMPACT_BYTES);
 }
 
-uint8_t samplesFor(uint32_t interval_s, uint16_t cadence_s) {
+uint8_t samplesFor(uint32_t interval_s, uint16_t cadence_s, uint8_t cap) {
   if (cadence_s == 0) cadence_s = 1;
   const uint32_t n = interval_s / cadence_s;
   if (n < 1) return 1;
-  return (n > SAMPLES) ? SAMPLES : (uint8_t)n;
+  return (n > cap) ? cap : (uint8_t)n;
 }
 
 // A bit writer and reader over the fifteen bytes. Big-endian, most significant
@@ -91,12 +92,100 @@ int16_t signExtend(uint32_t v, uint8_t bits) {
 }
 
 void apply(double& lat, double& lon, int16_t east, int16_t north,
-           double m_lon) {
-  lat += north * STEP_M / M_PER_DEG;
-  lon += east * STEP_M / m_lon;
+           double m_lon, double step_m = STEP_M) {
+  lat += north * step_m / M_PER_DEG;
+  lon += east * step_m / m_lon;
+}
+
+int decodeCompact(const uint8_t* body, Point* out, uint8_t cap,
+                  uint16_t& cadence_s) {
+  Reader r(body);
+  if (r.take(2) != COMPACT_FORM) return -1;   // a layout this build does not know
+  cadence_s = CADENCES[r.take(4)];
+  const double step_m = COMPACT_STEPS_M[r.take(2)];
+
+  uint8_t head[slimcodec::POS_BYTES];
+  for (uint8_t i = 0; i < slimcodec::POS_BYTES; i++) head[i] = (uint8_t)r.take(8);
+  double lat, lon;
+  if (!slimcodec::decodePos(head, slimcodec::POS_BYTES, lat, lon)) return -1;
+
+  out[0].lat = lat;
+  out[0].lon = lon;
+  out[0].fix = true;
+  uint8_t n = 1;
+  const double m_lon = M_PER_DEG * cos(lat * RAD_PER_DEG);
+  double alat = lat, alon = lon;
+  for (uint8_t i = 0; i + 1 < COMPACT_SAMPLES; i++) {
+    const int16_t east = signExtend(r.take(COMPACT_BITS), COMPACT_BITS);
+    const int16_t north = signExtend(r.take(COMPACT_BITS), COMPACT_BITS);
+    if (east == COMPACT_NONE || north == COMPACT_NONE) break;
+    apply(alat, alon, east, north, m_lon, step_m);
+    if (n >= cap) break;
+    out[n].lat = alat;
+    out[n].lon = alon;
+    out[n].fix = true;
+    n++;
+  }
+  return n;
 }
 
 }  // namespace
+
+int encodeCompact(const Point* points, uint8_t count, uint16_t cadence_s,
+                  uint8_t* out, uint8_t cap) {
+  if (points == 0 || count == 0 || cap < COMPACT_BYTES) return -1;
+  if (!points[0].fix) return -1;        // that report is the zero-body form
+
+  // Every scale, finest first; the one that carries the most samples wins,
+  // and the finer of two that carry as many. As slim_track._encode_compact.
+  const double m_lon = M_PER_DEG * cos(points[0].lat * RAD_PER_DEG);
+  uint8_t best_scale = 0, best_n = 0;
+  int16_t best_e[COMPACT_SAMPLES - 1] = {0}, best_no[COMPACT_SAMPLES - 1] = {0};
+  for (uint8_t s = 0; s < 4; s++) {
+    const double step_m = COMPACT_STEPS_M[s];
+    int16_t e_[COMPACT_SAMPLES - 1] = {0}, n_[COMPACT_SAMPLES - 1] = {0};
+    uint8_t got = 0;
+    double alat = points[0].lat, alon = points[0].lon;
+    for (uint8_t i = 1; i < COMPACT_SAMPLES; i++) {
+      if (i >= count || !points[i].fix) break;   // a gap ends the trail
+      const long e = roundHalfEven((points[i].lon - alon) * m_lon / step_m);
+      const long n = roundHalfEven((points[i].lat - alat) * M_PER_DEG / step_m);
+      if (e < COMPACT_MIN || e > COMPACT_MAX || n < COMPACT_MIN || n > COMPACT_MAX) {
+        break;                                    // too far at this scale
+      }
+      e_[got] = (int16_t)e;
+      n_[got] = (int16_t)n;
+      got++;
+      // From where it decodes to, as in the long form.
+      apply(alat, alon, (int16_t)e, (int16_t)n, m_lon, step_m);
+    }
+    if (s == 0 || got > best_n) {
+      best_scale = s;
+      best_n = got;
+      for (uint8_t k = 0; k < COMPACT_SAMPLES - 1; k++) {
+        best_e[k] = e_[k];
+        best_no[k] = n_[k];
+      }
+    }
+  }
+
+  memset(out, 0, COMPACT_BYTES);
+  Writer w(out);
+  w.put(COMPACT_FORM, 2);
+  w.put(cadenceIndex(cadence_s), 4);
+  w.put(best_scale, 2);
+  uint8_t head[slimcodec::POS_BYTES];
+  slimcodec::encodePos(points[0].lat, points[0].lon, head);
+  for (uint8_t i = 0; i < slimcodec::POS_BYTES; i++) w.put(head[i], 8);
+  const uint32_t mask = (1u << COMPACT_BITS) - 1;
+  for (uint8_t k = 0; k < COMPACT_SAMPLES - 1; k++) {
+    const int16_t east = (k < best_n) ? best_e[k] : COMPACT_NONE;
+    const int16_t north = (k < best_n) ? best_no[k] : COMPACT_NONE;
+    w.put((uint32_t)east & mask, COMPACT_BITS);
+    w.put((uint32_t)north & mask, COMPACT_BITS);
+  }
+  return COMPACT_BYTES;
+}
 
 int encode(const Point* points, uint8_t count, uint16_t cadence_s,
            uint8_t* out, uint8_t cap) {
@@ -144,6 +233,7 @@ int encode(const Point* points, uint8_t count, uint16_t cadence_s,
 int decode(const uint8_t* body, uint8_t len, Point* out, uint8_t cap,
            uint16_t& cadence_s) {
   if (!isTrack(body, len) || out == 0 || cap == 0) return -1;
+  if (len == COMPACT_BYTES) return decodeCompact(body, out, cap, cadence_s);
   Reader r(body);
   if (r.take(2) != 0) return -1;        // a layout this build does not know
   cadence_s = CADENCES[r.take(4)];

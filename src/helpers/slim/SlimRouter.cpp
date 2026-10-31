@@ -43,7 +43,10 @@ bool Routes::learn(uint8_t src, uint8_t hop, uint8_t hops, uint32_t now,
     e.snr = snr;
     return false;
   }
-  if (alive && cost(hops, snr) >= cost(e.hops, e.snr) - ROUTE_HYST_DB) {
+  // The route in use, charged for every minute nobody has come that way.
+  const int16_t aged = cost(e.hops, e.snr)
+      + (int16_t)((uint32_t)(now - e.at) * ROUTE_AGE_DB_PER_MIN / 60000UL);
+  if (alive && cost(hops, snr) >= aged - ROUTE_HYST_DB) {
     // Not enough better to be worth changing to. Not touched at all - its
     // age is the age of the last packet that actually came that way.
     return false;

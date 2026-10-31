@@ -86,10 +86,46 @@ class CustomSX1262 : public SX1262 {
       return true;  // success
     }
 
+#ifdef WITH_MESH_SLIM
+    using SX1262::startReceive;
+    //: Listen-before-talk hears a frame from its preamble, not only from its
+    //: header - which at SF12 is most of a second in, long enough for a
+    //: second transmitter to start on top of it. RadioLib's default receive
+    //: leaves PREAMBLE_DETECTED out of the flags the chip latches, so the
+    //: test in isReceiving could never be true.
+    int16_t startReceive() override {
+      _preamble_at = 0;
+      return SX1262::startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF,
+          RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED),
+          RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+    }
+    //: A preamble with no header behind it - noise that looked like one, or a
+    //: frame on another sync word - stays latched until the next receive, and
+    //: would read as a busy channel for ever. Let go once a header would have
+    //: followed: the rest of a 16-symbol preamble, the sync word and the
+    //: header are under a second at SF12.
+    static const unsigned long PREAMBLE_STALE_MS = 2000;
+    unsigned long _preamble_at = 0;
+#endif
+
     bool isReceiving() {
       uint16_t irq = getIrqFlags();
+#ifdef WITH_MESH_SLIM
+      if (irq & SX126X_IRQ_HEADER_VALID) return true;
+      if (!(irq & SX126X_IRQ_PREAMBLE_DETECTED)) {
+        _preamble_at = 0;
+        return false;
+      }
+      const unsigned long now = millis();
+      if (_preamble_at == 0) _preamble_at = now ? now : 1;
+      if (now - _preamble_at < PREAMBLE_STALE_MS) return true;
+      clearIrqFlags(SX126X_IRQ_PREAMBLE_DETECTED);
+      _preamble_at = 0;
+      return false;
+#else
       bool detected = (irq & SX126X_IRQ_HEADER_VALID) || (irq & SX126X_IRQ_PREAMBLE_DETECTED);
       return detected;
+#endif
     }
 
     bool getRxBoostedGainMode() {

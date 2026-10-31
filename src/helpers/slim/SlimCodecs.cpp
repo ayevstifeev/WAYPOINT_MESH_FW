@@ -222,7 +222,8 @@ bool decodeSelfReport(const char* text, uint8_t& role, uint8_t& number,
 
 // ---- backlog ------------------------------------------------------------
 
-uint8_t encodeHistory(char* out, const HistPoint* pts, uint8_t n) {
+uint8_t encodeHistory(char* out, const HistPoint* pts, uint8_t n,
+                      uint32_t sent_s, uint8_t max_points) {
   if (out == nullptr || pts == nullptr || n == 0) return 0;
 
   // The first point chooses the anchor, as in history.encode: a message is one
@@ -233,13 +234,19 @@ uint8_t encodeHistory(char* out, const HistPoint* pts, uint8_t n) {
   anchorFor(pts[0].lat, pts[0].lon, alat, alon, code);
 
   out[0] = '!'; out[1] = 'H';
-  encDigits(0, 1, &out[2]);                  // seq
+  encDigits(sent_s ? HIST_TIMED : 0, 1, &out[2]);   // seq
   encDigits(1, 1, &out[3]);                  // total
   memcpy(&out[4], code, 4);
 
   char* p = out + HIST_HEADER_CHARS;
+  uint8_t cap = max_points < HIST_MAX_POINTS ? max_points : HIST_MAX_POINTS;
+  if (sent_s) {
+    encDigits(sent_s, HIST_RECORD_CHARS, p);
+    p += HIST_RECORD_CHARS;
+    if (cap == HIST_MAX_POINTS) cap--;       // the time took a record's room
+  }
   uint8_t k = 0;
-  for (; k < n && k < HIST_MAX_POINTS; k++) {
+  for (; k < n && k < cap; k++) {
     if (!fits(pts[k].lat, pts[k].lon, alat, alon)) break;
     long ilat, ilon;
     offsets(pts[k].lat, pts[k].lon, alat, alon, ilat, ilon);

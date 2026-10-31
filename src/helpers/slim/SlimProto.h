@@ -186,8 +186,17 @@ struct Counts {
   //: rejected by Router::send and dropped without a word, which from
   //: outside looks exactly like a node that will not answer.
   uint32_t refused;
+  //: ...and MeshCore packets kept off the air because slim is active: an
+  //: advert, an ack, a path return, anything MeshCore built. Each one is a
+  //: frame no slim receiver can read, as much airtime as a real one, and a
+  //: collision with whatever a unit was saying - so the dispatcher refuses
+  //: them all, at the one place every transmission passes, and counts them
+  //: here. Anything above zero is a caller that should have spoken slim.
+  uint32_t blocked;
 };
 const Counts& counts();
+//: Counted by the dispatcher when it refuses a MeshCore packet. See blocked.
+void noteBlocked();
 
 //: What the radio measured about one reception.
 //:
@@ -198,12 +207,76 @@ const Counts& counts();
 struct Link {
   int8_t  snr_q4;   //: SNR in quarter-dB, as mesh::Packet carries it
   int16_t rssi;     //: dBm, or 0 when the build cannot measure it
+  uint8_t len;      //: bytes on the air - what an answer has to wait out
 };
+
+// ---- when to answer -----------------------------------------------------
+//
+// **An answer sent while the asker is still transmitting is never heard.**
+// Every sender puts txBurst() identical copies on the air back to back, and
+// what is decoded is normally copy one - so the rest of the burst is still
+// going out, and a half-duplex radio hears nothing while its own
+// transmitter is on.
+//
+// It used to be a flat 2.5 s, chosen at SF11/250k where a whole burst took
+// about that long. At SF12/125k a 13-byte position is 1.5 s a copy, so the
+// base answered into copy three of every report - its own log said "channel
+// still busy, transmitting anyway" each time - and MRPT01 answered the Pi's
+// ping while the Pi was still sending it, so not one reading arrived
+// (2026-10-23). The time is the asker's airtime, so it is worked out from it.
+//
+// The same numbers are slim_node.py's REPLY_QUIET_S, REPLY_COPY_GAP_S and
+// REPLY_MARGIN_S: one fact about the radio, three implementations, and
+// test_reply_timing.py pins them equal.
+//
+// **Since every frame goes once** (2026-10-23) a decoded frame's sender has
+// stopped and is listening, so an answer waits only the turnaround: half a
+// second. The 2.5 s floor kept from the three-copy days was most of every
+// acknowledgement a person was watching for (lowered 2026-10-29).
+static const uint32_t REPLY_QUIET_MIN_MS = 500;   //: never less than this
+static const uint32_t REPLY_COPY_GAP_MS  = 250;   //: between two copies
+static const uint32_t REPLY_MARGIN_MS    = 500;   //: turnaround, clock skew
+//: ...but what an ASKER allows the far end is the slowest answer still in
+//: the field. Units flashed before 2026-10-29 - the repeaters on the hills,
+//: until their next flash - hold theirs 2.5 s, and a wait cut to this
+//: unit's own half second retries an answer that is on its way: the same
+//: words twice. Lower it once every unit has been flashed.
+static const uint32_t PEER_QUIET_MAX_MS  = 2500;
+static const uint32_t ACK_WAIT_MIN_MS    = 8000;
+//: The longest a repeater holds a frame before relaying it, in half-airtimes
+//: of that frame: MeshCore's getRetransmitDelay, rand(0..5) x airtime x
+//: tx_delay_factor, which is 0.5 on a repeater. Two and a half airtimes.
+static const uint32_t RELAY_HOLD_AIRTIMES_X2 = 5;
+
+//: How long to hold an answer to a frame that took `airtime_ms` on the air:
+//: the rest of its burst, then a margin.
+uint32_t replyQuietMs(uint32_t airtime_ms);
+//: How long the slowest unit in the field holds ITS answer to such a frame:
+//: what a wait for somebody else's answer allows. See PEER_QUIET_MAX_MS.
+uint32_t peerQuietMs(uint32_t airtime_ms);
+//: How long a sender waits for the acknowledgement of a frame that takes
+//: `airtime_ms` before trying again. A retry goes under a new sequence
+//: number, so one sent before the first attempt's ack could arrive is the
+//: same message shown twice: the far end's whole exchange, plus a repeater
+//: holding and relaying it each way, and never less than ACK_WAIT_MIN_MS.
+//: "Twice the exchange" was too short through MRPT01 at SF12: a canned
+//: reply's ack took 13-16 s to come back, and every one was sent again
+//: (2026-10-23).
+uint32_t ackWaitMs(uint32_t airtime_ms);
+//: How long until a frame this long has been answered directly OR carried on
+//: by a repeater, whichever is later - so a sender that has heard NEITHER by
+//: then knows it did not get out, and can try again rather than wait out
+//: ackWaitMs, which allows for the answer coming back through a repeater.
+uint32_t fastWaitMs(uint32_t airtime_ms);
 
 class Handler {
 public:
   virtual ~Handler() {}
   virtual void onSlimRecv(const slim::Frame& f, const Link& link) = 0;
+  //: One of this node's own frames, carried back by somebody else: it got
+  //: out, and whatever answers it has further to come. Nothing by default -
+  //: a node that never waits on an answer has no use for it.
+  virtual void onSlimEcho(const slim::Frame& f) { (void)f; }
 };
 
 void setHandler(Handler* h);

@@ -268,29 +268,38 @@ public:
   //: counters in one frame. See slimhealth.
   void sendSlimStatus(uint8_t to, uint16_t wanted, int ttl);
   //: One slim frame onto the air. The only place this example obtains
-  //: a packet, so the release-on-failure path exists once.
-  void sendSlimFrame(uint8_t type, const uint8_t* body, uint8_t len,
-                     uint8_t to, int ttl, bool prefer_direct = true);
+  //: a packet, so the release-on-failure path exists once. Returns the
+  //: frame's length, 0 if nothing was queued.
+  uint8_t sendSlimFrame(uint8_t type, const uint8_t* body, uint8_t len,
+                     uint8_t to, int ttl, bool prefer_direct = true,
+                     uint8_t copies = 1);
   //: Say who this repeater is: callsign and public key, to everyone.
   //:
   //: A repeater has no position to report, so before this it was silent
   //: except when relaying - and a base on a slim-only network had no
   //: way to learn it existed, let alone address its command line.
-  void sendSlimAdvert();
-  //: When the next one goes out, in millis(). See the companion radio's
-  //: for why it repeats rather than going once at boot.
+  //: Returns the frame's length, 0 if nothing was queued.
+  uint8_t sendSlimAdvert();
+  //: When the next one goes out, in millis(): five at boot, then only when
+  //: no base has asked. See SLIM_ADVERT_ROUND and SLIM_ADVERT_UNASKED_MS.
   unsigned long _slim_advert_at = 0;
+  //: The latest advert, which a base's acknowledgement names; how many of
+  //: the boot round are still to go (SLIM_ADVERT_ROUND); and whether the
+  //: health reading that follows the first acknowledgement is still owed.
+  uint8_t _slim_advert_seq = 0;
+  uint8_t _slim_advert_left = 0;
+  bool _slim_status_owed = false;
   //: The volunteered health reading, on its own clock. Sent back to back
   //: with the advert it contended with this node's own airtime and was
-  //: usually lost - one arrived all evening. Ten seconds apart, both are
-  //: heard.
+  //: usually lost - one arrived all evening. So it goes once the base has
+  //: acknowledged the advert, and that exchange is over: see onSlimRecv.
   unsigned long _slim_status_at = 0;
   //: One line of CLI reply. `line` must already begin "!A"; see the
   //: definition for why it is not copied to add it.
   void sendSlimText(uint8_t to, char* line);
   //: "!A<ts-hex> <command>" from the base. Silent for anything that is
   //: not a well-formed admin frame, in which case nothing was run.
-  void handleSlimAdmin(uint8_t from, char* msg);
+  void handleSlimAdmin(uint8_t from, char* msg, uint32_t quiet_ms);
 
   //: An answer owed, to be transmitted from loop() rather than from
   //: inside the receive callback. Sending from onSlimRecv puts a
@@ -299,8 +308,9 @@ public:
   uint8_t _slim_reply_to = 0;        // 0 = nothing owed
   //: Not before this. The base asks as a burst of MESH_SLIM_BURST copies,
   //: and a reply sent the instant the first copy lands is transmitted into
-  //: the second and third. The base waits 20 s for an answer, so a couple
-  //: of seconds of quiet costs nothing and is the difference between an
+  //: the second and third: slimproto::replyQuietMs, from the airtime of
+  //: the frame being answered. The base waits 20 s for an answer, so a few
+  //: seconds of quiet costs nothing and is the difference between an
   //: answer and a repeater that reads as dead.
   unsigned long _slim_reply_at = 0;
   uint16_t _slim_reply_want = 0;     // status fields, when replying to a ping

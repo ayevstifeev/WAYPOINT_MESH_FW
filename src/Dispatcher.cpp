@@ -64,6 +64,16 @@ uint32_t Dispatcher::getCADFailRetryDelay() const {
   return 200;
 }
 uint32_t Dispatcher::getCADFailMaxDuration() const {
+#ifdef WITH_MESH_SLIM
+  // As long as one whole frame can take. At SF12 an advert is six seconds on
+  // the air, so four forced this node's frame into the second half of one -
+  // and since the SX1262 hears a frame from its preamble, a frame is now
+  // seen as busy from its start. A stale preamble is let go in the radio
+  // (CustomSX1262::PREAMBLE_STALE_MS), so this bounds real traffic only.
+  if (slimproto::active()) {
+    return _radio->getEstAirtimeFor(SLIM_MAX_FRAME) + 1000;
+  }
+#endif
   return 4000;   // 4 seconds
 }
 
@@ -324,6 +334,24 @@ void Dispatcher::checkSend() {
   cad_busy_start = 0;  // reset busy state
 
   outbound = _mgr->getNextOutbound(_ms->getMillis());
+#ifdef WITH_MESH_SLIM
+  // **On slim, nothing but slim goes on the air.** Every slim frame is carried
+  // as RAW_CUSTOM (slimproto::frameToPacket); anything else was built by
+  // MeshCore - an advert, an ack, a path, a login - and on the slim sync word
+  // it is a frame no receiver can authenticate, a full packet's airtime, and
+  // a collision with whoever was talking. Refused here, the one place every
+  // transmission passes, rather than at each caller: a repeater on slim kept
+  // sending MeshCore adverts every two minutes, and one of them, a second
+  // behind its slim advert at boot, left the base with a header error and no
+  // contact for the repeater four resets running (2026-10-23).
+  if (outbound && slimproto::active()
+      && outbound->getPayloadType() != PAYLOAD_TYPE_RAW_CUSTOM) {
+    slimproto::noteBlocked();
+    _mgr->free(outbound);
+    outbound = NULL;
+    return;
+  }
+#endif
   if (outbound) {
     int len = 0;
     uint8_t raw[MAX_TRANS_UNIT];

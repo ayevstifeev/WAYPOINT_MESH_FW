@@ -180,6 +180,9 @@ public:
   unsigned long getTotalAirTime() const { return total_air_time; }
   unsigned long getReceiveAirTime() const {return rx_air_time; }
   unsigned long getRemainingTxBudget() const { return tx_budget_ms; }
+  //: A packet is on the air right now. It has left the queue, so a caller
+  //: asking "is anything queued" sees nothing while it is being sent.
+  bool isTransmitting() const { return outbound != NULL; }
   uint32_t getNumSentFlood() const { return n_sent_flood; }
   uint32_t getNumSentDirect() const { return n_sent_direct; }
   uint32_t getNumRecvFlood() const { return n_recv_flood; }

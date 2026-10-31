@@ -70,8 +70,15 @@
 //: How long the radio stays listening after the last transmission of a
 //: report. Long enough for the report to reach the base through a repeater and
 //: a command to come back the same way; each second of it costs about 5 mA.
+//:
+//: Twenty, not ten. Through a repeater at SF12 that round trip is the
+//: repeater's hold (up to two and a half airtimes) and relay each way, plus
+//: the base's own hold-off and frame: 9-19 s for a short message. At ten
+//: seconds the base resent "Test 1 from base" to MTRK01 five times, each
+//: arriving after the receiver had gone back to sleep, and gave up
+//: (2026-10-23). Ten more seconds a report is about 0.3 mA on average.
 #ifndef TRACKER_LISTEN_S
-  #define TRACKER_LISTEN_S 10
+  #define TRACKER_LISTEN_S 20
 #endif
 //: Give up on a fix after this long and send nothing. A hot start takes a few
 //: seconds; a cold one, after the GPS has lost its almanac, can take a minute.
@@ -139,6 +146,14 @@
   #define TRACKER_SAMPLE_S 60
 #endif
 
+//: The interval a unit reports at when nobody has told it one: no saved
+//: choice, which is every unit after an erase. 0 boots it as an ordinary
+//: node, which is stock MeshCore's behaviour; the slim tracker envs set it
+//: from `tracker` in [slim] so a handheld comes up reporting.
+#ifndef TRACKER_DEFAULT_S
+  #define TRACKER_DEFAULT_S 0
+#endif
+
 //: How long a slot is, until a base says otherwise in a round-ack.
 //:
 //: **A default rather than nothing.** Slotting only needs the UNITS to
@@ -152,9 +167,9 @@
 #endif
 
 //: Fixes kept while the base cannot be reached. At a report a minute that is
-//: two hours out of range; at five minutes, ten. 12 bytes each.
+//: four hours out of range; at five minutes, twenty. 12 bytes each.
 #ifndef TRACKER_BACKLOG_POINTS
-  #define TRACKER_BACKLOG_POINTS 120
+  #define TRACKER_BACKLOG_POINTS 240
 #endif
 //: Longest nap between checks while asleep. A board with buttons polls them
 //: between naps, so it needs short ones or a press goes unseen; without
@@ -248,6 +263,12 @@ public:
   //: is looked for straight away. False for an interval out of range.
   bool start(uint32_t interval_s, uint32_t now);
   void stop() { _phase = OFF; }
+  //: Report now rather than at the next slot. For the fix that comes back
+  //: after a "no fix" report: the base's last word from this unit is that it
+  //: does not know where it is, and that must not stand for an interval
+  //: once it does. From SLEEP, or from a FIX waiting on a slot or a sample;
+  //: in LISTEN a report has just gone.
+  void reportNow(uint32_t now);
 
   bool on() const { return _phase != OFF; }
   Phase phase() const { return _phase; }
@@ -327,6 +348,11 @@ public:
   void setClock(uint32_t epoch_s, uint32_t now);
   bool hasClock() const { return _clock_set; }
   uint32_t epoch(uint32_t now) const;
+  //: The same to the millisecond, for timing inside a second; 0 with no clock.
+  uint64_t epochMs(uint32_t now) const {
+    return _clock_set ? (uint64_t)_epoch_s * 1000ULL + (uint32_t)(now - _clock_at)
+                      : 0;
+  }
 
   //: Which slot this unit owns. `unit` 0 turns slotting off, which is the
   //: state every unit is in until the base programs it.
@@ -430,8 +456,10 @@ public:
   bool historyDue() const;
   //: The next "!H" message, from the oldest points, aged against `now_s`.
   //: `out` needs slimcodec::HIST_MAX_TEXT + 1 bytes. Returns how many points
-  //: it carries; 0 means nothing to send.
-  uint8_t nextHistory(char* out, uint32_t now_s) const;
+  //: it carries; 0 means nothing to send. `epoch_s` and `max_points` as in
+  //: slimcodec::encodeHistory.
+  uint8_t nextHistory(char* out, uint32_t now_s, uint32_t epoch_s = 0,
+                      uint8_t max_points = 255) const;
   //: That message went out with this ack, carrying `n` points.
   void historySent(uint32_t ack, uint8_t n) { _hist_ack = ack; _hist_n = n; }
   //: A report is out and not yet acknowledged.

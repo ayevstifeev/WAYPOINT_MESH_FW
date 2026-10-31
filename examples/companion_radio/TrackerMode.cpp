@@ -171,6 +171,18 @@ uint32_t Schedule::nextSampleAt(uint32_t now) const {
   return first + (((e - first) / _sample_s) + 1) * _sample_s;
 }
 
+void Schedule::reportNow(uint32_t now) {
+  // From FIX too: a slotted unit spends most of a trail cycle in FIX waiting
+  // for a sample instant, and a fix found then waited for that instant -
+  // 40 s in the simulation - before going to sleep and only then reporting.
+  if (_phase != SLEEP && _phase != FIX) return;
+  _sample_at = 0;          // not for a slot: see the FIX case in tick
+  if (_phase == SLEEP) {
+    _cycle_at = now;
+    enter(FIX, now);
+  }
+}
+
 bool Schedule::step(uint32_t now, bool fix, bool quiet) {
   return tick(now, fix, quiet) == REPORT;
 }
@@ -178,14 +190,24 @@ bool Schedule::step(uint32_t now, bool fix, bool quiet) {
 Schedule::Action Schedule::tick(uint32_t now, bool fix, bool quiet) {
   switch (_phase) {
     case FIX: {
-      if (slotted()) {
+      // A FIX phase that was started for a slot waits for that slot. One
+      // that was not - at boot, or by reportNow - ends the free-running way
+      // below, on the fix or on the timeout, even though the fix it finds
+      // also sets the clock and so turns slotting on halfway through.
+      //
+      // That used to send it to sleep instead: the first fix set the clock,
+      // the phase found itself slotted with no slot to wait for, and a unit
+      // that had just found the sky said nothing until its slot came round.
+      // Simulated on 2026-10-22: a fix at 40 s reported at 100 s, and one
+      // found at 120 s after a "no fix" report at 280 s - two and a half
+      // minutes of the base showing NO GPS FIX for a unit that had one.
+      if (slotted() && _sample_at != 0) {
         // The GPS was started for one particular moment, and that moment
         // is what this phase is waiting for. Asking "which slot does now
         // fall in" instead would read every instant after this round's
         // slot as one that had been missed - including the whole of the
         // round spent collecting samples for the NEXT one.
         const uint32_t e = epoch(now);
-        if (_sample_at == 0) { enter(SLEEP, now); return NOTHING; }
         if (e < _sample_at) return NOTHING;   // early: keep looking
         const uint32_t at = slimround::slotStart(_sample_at, _interval_s,
                                                  _slot_unit,
@@ -349,16 +371,18 @@ bool Reports::historyDue() const {
   return _linked && _hist_ack == 0 && _backlog.size() > 0;
 }
 
-uint8_t Reports::nextHistory(char* out, uint32_t now_s) const {
+uint8_t Reports::nextHistory(char* out, uint32_t now_s, uint32_t epoch_s,
+                             uint8_t max_points) const {
   slimcodec::HistPoint pts[slimcodec::HIST_MAX_POINTS];
   uint8_t n = 0;
-  for (; n < slimcodec::HIST_MAX_POINTS && n < _backlog.size(); n++) {
+  for (; n < max_points && n < slimcodec::HIST_MAX_POINTS
+         && n < _backlog.size(); n++) {
     const Fix& f = _backlog[n];
     pts[n].lat = f.lat;
     pts[n].lon = f.lon;
     pts[n].age_s = now_s >= f.at_s ? now_s - f.at_s : 0;
   }
-  return slimcodec::encodeHistory(out, pts, n);
+  return slimcodec::encodeHistory(out, pts, n, epoch_s, max_points);
 }
 
 }  // namespace tracker

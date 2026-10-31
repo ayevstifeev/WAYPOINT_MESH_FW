@@ -87,6 +87,11 @@ public:
   //: 62.5 kHz that works out at a look roughly once a second; at SF11 and
   //: 250 kHz, eight times as often for the same power.
   virtual bool startSniffing() { return false; }
+  //: A packet has arrived and nobody has read it yet. **A sniffing radio
+  //: holds what it caught and stops listening until it is read**, so a
+  //: caller that parks the radio has to ask this, or the frame waits for
+  //: the next time it happens to look - see MyMesh::trackerLoop.
+  bool packetWaiting() const;
 #endif
   uint32_t getRngSeed();
   void setTxPower(int8_t dbm);
