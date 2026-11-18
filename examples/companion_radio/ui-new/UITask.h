@@ -72,6 +72,8 @@ class UITask : public AbstractUITask {
   UIScreen* curr;
 #ifdef WITH_SLIM_UI
   UIScreen* send_menu;
+  UIScreen* to_menu;            //: who a message is for, before what it says
+  uint8_t _send_to = 0;
   UIScreen* marker_menu;
   TrackerScreen* every_menu;
   UIScreen* link_test;
@@ -109,7 +111,13 @@ public:
   void gotoInbox();
   int msgsUnread() const;
   int msgsKept() const;
+  //: Who to send to - the base at the top - and then what to say.
   void gotoSend();
+  //: What to say, to `to` (a unit, slim::ADDR_BASE, or 0 for everyone):
+  //: for an answer, whose recipient is the sender and needs no asking.
+  void gotoSendTo(uint8_t to);
+  //: Who the message being chosen or typed is for.
+  uint8_t sendTo() const { return _send_to; }
   void gotoMarker();
   //: The interval list, opened on whatever this unit is doing now.
   void gotoTrackerEvery();

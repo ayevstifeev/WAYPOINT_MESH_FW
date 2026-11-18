@@ -230,6 +230,10 @@ public:
   //: from that frame's own airtime. Set by onSlimRecv, which is the only
   //: place anything is owed from.
   uint32_t _owed_quiet = slimproto::REPLY_QUIET_MIN_MS;
+  //: ...and the airtime of that frame, for what is sent because its sender
+  //: was heard rather than in answer to it: a held copy waits out the
+  //: frame's relays (slimproto::relaySpanMs), not just its burst.
+  uint32_t _heard_air_ms = 0;
   //: How long an addressed frame with this much body gets to be
   //: acknowledged before it goes again. See slimproto::ackWaitMs.
   uint32_t slimAckWaitMs(uint8_t body_len);
@@ -435,7 +439,14 @@ public:
   static const uint8_t SLIM_PINS_OWED = 4;
   Outgoing _pins_owed[SLIM_PINS_OWED];
   void holdPin();
-  void resumePin();
+  //: `heard` has just been heard: the oldest thing held for it goes now.
+  //: The base is the way back for a pin or a message to the base; a
+  //: message to a unit waits for that unit, because hearing the base says
+  //: nothing about whether a unit that has gone quiet is listening.
+  void resumePin(uint8_t heard);
+  //: Units heard reporting a position, as a bit each: the trackers this
+  //: unit can offer as recipients. See slimRecipients.
+  uint16_t _pos_from = 0;
 
   //: Words shown once: the same text from the same unit inside
   //: SLIM_REPEAT_MS, with nothing said to that unit since, is a retry whose
@@ -513,13 +524,21 @@ public:
   //: A report's acknowledgement on rounds: at the fixed moment in that
   //: tracker's own slot, after the last relay of its report can have gone,
   //: as SlimBridge._ack_report does on the Pi. Outside its slot, at once.
-  void oweSlotAck(uint8_t unit, uint8_t seq, uint16_t want);
+  //: On a round planned for it (`_round_direct`), unrelayed, and only for a
+  //: report heard straight: `hops` is how this one came.
+  void oweSlotAck(uint8_t unit, uint8_t seq, uint16_t want, uint8_t hops);
 
   uint32_t _round_s = 0;        // the round, or 0 for none
   uint8_t _round_slot_s = 0;
   uint8_t _round_units = slimround::MAX_UNIT;   // slots in use
   uint32_t _round_ack_in_ms = 0;  // into a slot; 0: the round-ack only
   uint16_t _round_heard = 0;    // who has reported since the last ack
+  //: ...and those the round-ack must be relayed to reach: heard through a
+  //: repeater, or reporting no fix (it sets that unit's clock).
+  uint16_t _round_far = 0;
+  //: The app planned this round for answers nobody relays: the fifth part
+  //: of `round:`, 0 (2026-11-09). A four-part round is answered as before.
+  bool _round_direct = false;
   uint32_t _round_ack_at = 0;   // the round whose ack has already gone
 
   //: **A slot is a moment in GPS time, and this node has no GPS.** Every
@@ -563,7 +582,17 @@ public:
 
   //: The base's round-ack: the time, the slot length, and whether this
   //: unit was among those heard. One frame doing the work of sixteen.
-  void onRoundAck(const slim::Frame& f);
+  void onRoundAck(const slim::Frame& f, const slimproto::Link& link);
+  //: When this unit answers the base's team message: its place in the
+  //: round's free time (slimround::teamAckAt), or by unit number, an ack
+  //: and its relays apart, when there is no round to place it in.
+  uint32_t teamAckWaitMs(uint8_t me);
+  //: How far into the round the base sent its round-ack: where the free
+  //: time starts, for teamAckAt. Read off the round-ack's own epoch.
+  uint16_t _round_ack_off = 0;
+  //: When the GPS last set the clock. A round-ack sets it only when the GPS
+  //: has not lately - see onRoundAck.
+  unsigned long _gps_clock_at = 0;
 
   //: How long a slot is. The compiled-in default until a base says
   //: otherwise, so a unit slots itself from its own GPS clock rather
@@ -677,18 +706,20 @@ public:
   //: False if this build cannot switch, or slim has no operation key.
   bool saveSlimProto(bool on);
 
-  //: Send a line of text to whoever last sent US one, falling back to
-  //: the base. For the unit's own screen: somebody reading a message
-  //: on a hill answers the person who sent it, and has no way to pick
-  //: a recipient from a joystick.
+  //: Send a line of text from this unit's own screen to `to`: the base
+  //: (slim::ADDR_BASE), one unit, or - on a net with no base - everyone
+  //: (slim::ADDR_BROADCAST). A message to a unit is addressed to that
+  //: unit and acknowledged by it, not by the base.
   //:
   //: A canned phrase from slimtext::CODES costs ONE byte on the air,
   //: which is why the menu is worth having at all - it is not a
   //: shortcut for typing, it is a different order of airtime.
-  bool sendSlimText(const char* text);
-  //: Who a reply would go to, for the screen to name. 0 if nobody has
-  //: sent this unit anything yet.
+  bool sendSlimText(const char* text, uint8_t to);
+  //: The unit that last sent this one a message, or 0 if nobody has.
   uint8_t slimReplyTo() const { return _slim_reply_to; }
+  //: Who the last message from this screen went to: what "DELIVERED"
+  //: and "NOT DELIVERED" are about.
+  uint8_t textTo() const { return _out.to; }
 #endif
 
 #ifdef WITH_TRACKER_MODE
@@ -745,6 +776,17 @@ public:
   bool placeMarker(uint8_t icon, const char* label);
   //: Where this unit last knew it was. False if it never has.
   bool hereNow(double& lat, double& lon);
+
+  //: Who the screen offers a message to, in the order it offers them: the
+  //: base first - everyone, on a net with no base - then every other
+  //: tracker this unit knows of, by unit number. Known means on the
+  //: roster as a tracker, or heard reporting a position: repeaters report
+  //: no positions, so they never appear. Returns how many were written.
+  uint8_t slimRecipients(uint8_t* out, uint8_t cap) const;
+  //: A recipient as the screen names it: "Base", "Everyone" or a callsign.
+  void slimRecipientName(uint8_t to, char* out, uint8_t cap) const;
+  //: Seconds since `unit` was last heard, or -1 if it has not been.
+  long slimHeardAgo(uint8_t unit) const;
 #endif
 
   // To check if there is pending work
@@ -774,6 +816,17 @@ private:
   void loadSlimUnit();
   //: "!S1"/"!S0" from the base: save the protocol, restart once acked.
   bool protoCommand(const char* text, bool from_base);
+  //: "!R<sf>,<bw>,<cr>,<mins>,<in_s>" from the base: a radio speed for a
+  //: test, in `in_s` seconds, for `mins` minutes, then back to this unit's
+  //: saved settings by itself. Never saved. See MyMesh::radioCommand.
+  bool radioCommand(const char* text, bool from_base);
+  void tempRadioLoop();
+  unsigned long _tmp_radio_at = 0;      // when the test speed goes in; 0: none
+  unsigned long _tmp_radio_until = 0;   // when back to the saved settings
+  unsigned long _tmp_radio_by = 0;      // ...whichever is due, busy or not, by then
+  uint32_t _tmp_radio_mins = 0;
+  float _tmp_radio_bw = 0;
+  uint8_t _tmp_radio_sf = 0, _tmp_radio_cr = 0;
   //: The unit that last sent this one a direct message, so a reply
   //: typed on the screen has somewhere to go. 0 means nobody yet.
   uint8_t _slim_reply_to = 0;
@@ -846,6 +899,10 @@ private:
   //: Inside the twenty-second listen window.
   static const unsigned long TRACKER_HIST_HOLD_MS = 8000;
   unsigned long _hist_at = 0;
+  //: On rounds, how long until a piece of backlog `frame_len` bytes long,
+  //: its relays and its answer's fit in the round's free time: 0 for now.
+  //: Off rounds, always 0.
+  uint32_t histWaitMs(uint8_t frame_len);
 
   //: Tell whoever is carrying this unit whether it is still in touch.
   //: Nothing if there is no buzzer, and nothing while it is muted -

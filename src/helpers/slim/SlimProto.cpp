@@ -151,6 +151,16 @@ uint32_t ackWaitMs(uint32_t airtime_ms) {
   return wait > ACK_WAIT_MIN_MS ? wait : ACK_WAIT_MIN_MS;
 }
 
+uint32_t relaySpanMs(uint32_t airtime_ms) {
+  const uint32_t relays = slim::TTL_INIT > 1 ? slim::TTL_INIT - 1 : 0;
+  return relays * (airtime_ms * RELAY_HOLD_AIRTIMES_X2 / 2 + airtime_ms)
+         + REPLY_MARGIN_MS;
+}
+
+uint32_t floodMs(uint32_t airtime_ms) {
+  return airtime_ms + relaySpanMs(airtime_ms);
+}
+
 uint32_t fastWaitMs(uint32_t airtime_ms) {
   // The answer straight back: the frame, the answerer's hold, the answer...
   const uint32_t direct = airtime_ms + peerQuietMs(airtime_ms) + airtime_ms;

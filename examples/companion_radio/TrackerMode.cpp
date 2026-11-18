@@ -172,9 +172,10 @@ uint32_t Schedule::nextSampleAt(uint32_t now) const {
 }
 
 void Schedule::reportNow(uint32_t now) {
-  // From FIX too: a slotted unit spends most of a trail cycle in FIX waiting
-  // for a sample instant, and a fix found then waited for that instant -
-  // 40 s in the simulation - before going to sleep and only then reporting.
+  // Not for a slotted unit: its report is its slot's (see the FIX case in
+  // tick). Clearing _sample_at here would also lose the sample, or the
+  // slot, the GPS is already on for.
+  if (slotted()) return;
   if (_phase != SLEEP && _phase != FIX) return;
   _sample_at = 0;          // not for a slot: see the FIX case in tick
   if (_phase == SLEEP) {
@@ -190,18 +191,23 @@ bool Schedule::step(uint32_t now, bool fix, bool quiet) {
 Schedule::Action Schedule::tick(uint32_t now, bool fix, bool quiet) {
   switch (_phase) {
     case FIX: {
-      // A FIX phase that was started for a slot waits for that slot. One
-      // that was not - at boot, or by reportNow - ends the free-running way
-      // below, on the fix or on the timeout, even though the fix it finds
-      // also sets the clock and so turns slotting on halfway through.
+      // **A slotted unit transmits in its slot and nowhere else**, fix or
+      // no fix (the user's rule, 2026-11-08). A FIX phase that was started
+      // for a slot waits for that slot; one that was not - at boot, by a
+      // new interval, by a way through heard while searching - goes back
+      // to sleep below, and the schedule wakes it for its next slot.
       //
-      // That used to send it to sleep instead: the first fix set the clock,
-      // the phase found itself slotted with no slot to wait for, and a unit
-      // that had just found the sky said nothing until its slot came round.
-      // Simulated on 2026-10-22: a fix at 40 s reported at 100 s, and one
-      // found at 120 s after a "no fix" report at 280 s - two and a half
-      // minutes of the base showing NO GPS FIX for a unit that had one.
-      if (slotted() && _sample_at != 0) {
+      // From 2026-10-22 to 11-08 it reported the moment it found the sky,
+      // so the base was not left showing NO GPS FIX for up to a round. On
+      // 11-08 that put MTRK01's fix 47 s into the round, in MTRK02's slot,
+      // and MTRK02, sitting under a roof, did it in two rounds of three: a
+      // "no fix" in its slot and the fix on top of whoever came next. A
+      // round late is accurate enough; a collision costs both reports.
+      if (slotted() && _sample_at == 0) {
+        enter(SLEEP, now);
+        return NOTHING;
+      }
+      if (slotted()) {
         // The GPS was started for one particular moment, and that moment
         // is what this phase is waiting for. Asking "which slot does now
         // fall in" instead would read every instant after this round's

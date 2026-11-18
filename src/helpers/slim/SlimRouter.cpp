@@ -170,11 +170,18 @@ int Router::send(uint8_t type, const uint8_t* body, uint8_t body_len,
   }
 
   const uint8_t use_ttl = (ttl < 0) ? TTL_INIT : (uint8_t)ttl;
-  if (b.route == ROUTE_FLOOD && teachesRoutes(type) && use_ttl != TTL_INIT) {
+  if (b.route == ROUTE_FLOOD && teachesRoutes(type) && use_ttl != TTL_INIT
+      && use_ttl != 0) {
     // Not pedantry. Receivers derive hop count from TTL_INIT - ttl + 1, so a
     // flood launched at any other ttl teaches every node that hears it a wrong
     // distance, and wrong distances pick wrong routes for the fifteen minutes
     // until they expire.
+    //
+    // Except at 0, which is not a flood at all: nobody relays it, so it only
+    // ever arrives straight from its sender with HOP still naming the sender,
+    // and Routes::learn refuses exactly that. It teaches nothing, so nothing
+    // wrong. A base's round-ack goes that way when every unit heard it
+    // straight (2026-11-09). slim_packet.Router.send, the same rule.
     return ERR_ARG;
   }
   b.ttl = use_ttl;

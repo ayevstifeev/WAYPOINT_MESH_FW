@@ -84,8 +84,13 @@ int formatNoFix(const slim::Frame& f, char* out, uint8_t cap);
 //: voice net.
 void callsignFor(uint8_t unit, uint8_t role, char* out, uint8_t cap);
 
-//: The inverse: MTRK07 -> (tracker, 7). False if the name does not follow the
-//: scheme, or if the number is outside what a 4-bit unit can address.
+//: The number in a unit's callsign. A tracker's is its unit; a repeater's
+//: counts down from the base, so unit 14 is MRPT01 (SlimUnit.h).
+uint8_t numberFor(uint8_t unit, uint8_t role);
+
+//: The inverse: MTRK07 -> (tracker, 7), MRPT01 -> (repeater, 14). False if
+//: the name does not follow the scheme, or if the number is outside what a
+//: 4-bit unit can address.
 //:
 //: **This is the whole roster.** The unit number is already in the callsign, so
 //: walking MeshCore's own contact list is enough to build the pubkey<->unit map

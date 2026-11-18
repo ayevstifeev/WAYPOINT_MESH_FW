@@ -32,6 +32,21 @@ bool slotsFit(uint32_t interval, uint8_t slot_s, uint8_t units) {
   return (uint32_t)(units + 1) * slot_s <= interval;
 }
 
+uint32_t teamAckAt(uint32_t epoch, uint32_t interval, uint8_t slot_s,
+                   uint32_t ack_off, uint8_t unit, uint8_t place_s) {
+  if (interval == 0 || slot_s == 0) return 0;
+  uint32_t half = (slot_s / 2) ? (uint32_t)(slot_s / 2) : 1;
+  if (place_s > half) half = place_s;
+  const uint32_t lo = ack_off % interval + slot_s;
+  const uint32_t room = interval > lo ? (interval - lo) / half : 0;
+  if (room < 1) return 0;
+  const uint32_t nth = (uint32_t)((unit + MAX_UNIT - 1) % MAX_UNIT);
+  const uint32_t later = nth / room, pos = nth % room;
+  uint32_t at = epoch - (epoch % interval) + interval - (pos + 1) * half;
+  if (at < epoch) at += interval;
+  return at + later * interval;
+}
+
 int encodeAck(const Ack& a, uint8_t* out, uint8_t cap) {
   if (cap < ACK_BYTES) return -1;
   uint8_t slot = a.slot_s;

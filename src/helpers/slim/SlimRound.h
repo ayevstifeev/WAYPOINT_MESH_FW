@@ -60,6 +60,25 @@ uint32_t baseSlot(uint32_t interval, uint8_t slot_s, uint8_t units = MAX_UNIT);
 //: stops a one-minute round being asked to hold sixteen nine-second slots.
 bool slotsFit(uint32_t interval, uint8_t slot_s, uint8_t units = MAX_UNIT);
 
+//: When `unit` answers a team message it heard at `epoch`, or 0 when the
+//: round has no room (the caller staggers by unit instead). In the round's
+//: free time, never in a slot: half a slot each - an acknowledgement and its
+//: relays - packed back from the end of the round in unit order, because the
+//: start of the free time is the team map's. `ack_off` is how far into the
+//: round the base sends its round-ack, read off that ack's own epoch; the
+//: round-ack is the base's slot, so the free time starts a slot after it.
+//: Three seconds apart by number, MTRK02's answer landed on MTRK01's relays
+//: and the base's round-ack (2026-11-04).
+//:
+//: `place_s` is how long one answer and its relays hold the channel, from
+//: the caller's airtime. Each place is half a slot or that, whichever is
+//: longer: half an 18 s slot - the base answers unrelayed since 2026-11-09 -
+//: is shorter than one answer. With a 29 s slot it is still half a slot, so
+//: units flashed before and after place their answers alike.
+//: slim_round.team_ack_at, the same rule.
+uint32_t teamAckAt(uint32_t epoch, uint32_t interval, uint8_t slot_s,
+                   uint32_t ack_off, uint8_t unit, uint8_t place_s = 0);
+
 // ---- the round-ack ------------------------------------------------------
 //
 //     epoch:4   slot_s:1   heard:2       seven bytes

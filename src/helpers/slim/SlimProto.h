@@ -268,6 +268,14 @@ uint32_t ackWaitMs(uint32_t airtime_ms);
 //: then knows it did not get out, and can try again rather than wait out
 //: ackWaitMs, which allows for the answer coming back through a repeater.
 uint32_t fastWaitMs(uint32_t airtime_ms);
+//: How long after a frame has been heard its relays can still be on the air:
+//: every repeater a flood can cross (TTL_INIT - 1) in turn, each after its
+//: longest hold. Repeaters in a chain relay each other's copy, so the holds
+//: add up: MRPT02's copy of a report came a median 8 s and at worst 15 s
+//: after the tracker's own (2026-11-05). slim_node._relay_span_s.
+uint32_t relaySpanMs(uint32_t airtime_ms);
+//: A frame and every relay of it: what one transmission costs the channel.
+uint32_t floodMs(uint32_t airtime_ms);
 
 class Handler {
 public:

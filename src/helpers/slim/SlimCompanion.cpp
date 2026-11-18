@@ -39,6 +39,11 @@ bool readSelfReport(const char* text, uint8_t& role, uint8_t& unit,
   return true;
 }
 
+uint8_t numberFor(uint8_t unit, uint8_t role) {
+  return role == slimcodec::ROLE_REPEATER && unit < slim::ADDR_BASE
+             ? (uint8_t)(slim::ADDR_BASE - unit) : unit;
+}
+
 void callsignFor(uint8_t unit, uint8_t role, char* out, uint8_t cap) {
   // The naming scheme the operation already uses on the voice net. The unit
   // number is the briefing number, not a hash of a public key, which is why
@@ -48,7 +53,8 @@ void callsignFor(uint8_t unit, uint8_t role, char* out, uint8_t cap) {
     return;
   }
   snprintf(out, cap, "%s%02u",
-           role == slimcodec::ROLE_REPEATER ? "MRPT" : "MTRK", (unsigned)unit);
+           role == slimcodec::ROLE_REPEATER ? "MRPT" : "MTRK",
+           (unsigned)numberFor(unit, role));
 }
 
 uint32_t ackId(uint8_t unit, uint8_t seq) {
@@ -87,6 +93,16 @@ bool unitFromCallsign(const char* name, uint8_t& role, uint8_t& number) {
   // MTRK00 has no meaning under the scheme, and above 15 there is no unit
   // number to hold it.
   if (num < 1 || num > slim::MAX_ADDR) return false;
+  // **Repeaters count down from the base**, as on the Pi and in the repeater
+  // firmware (SlimUnit.h): MRPT01 is unit 14. Read as unit 1 here, a base
+  // with MRPT01 among its contacts gave MTRK01's unit to the repeater, so
+  // MTRK01's reports came up named MRPT01 and moved the repeater onto it
+  // (2026-11-03, the BLE base on an S25).
+  if (role == slimcodec::ROLE_REPEATER) {
+    if (num >= slim::ADDR_BASE) return false;
+    number = (uint8_t)(slim::ADDR_BASE - num);
+    return true;
+  }
   number = (uint8_t)num;
   return true;
 }
@@ -124,10 +140,11 @@ int formatPosition(const slim::Frame& f, char* out, uint8_t cap) {
   callsignFor(f.src, role, callsign, sizeof(callsign));
 
   char report[16];
-  // The number in the record is the unit number, so the app resolves the same
+  // The number in the record is the callsign's, so the app resolves the same
   // callsign from the record that we just wrote into the prefix. If those two
   // ever disagree the map shows one device twice under different names.
-  if (!slimcodec::encodeSelfReport(report, role, f.src, lat, lon)) return 0;
+  if (!slimcodec::encodeSelfReport(report, role, numberFor(f.src, role),
+                                   lat, lon)) return 0;
 
   return snprintf(out, cap, "%s: %s", callsign, report);
 }

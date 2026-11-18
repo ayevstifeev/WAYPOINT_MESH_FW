@@ -263,11 +263,10 @@ public:
   //: is looked for straight away. False for an interval out of range.
   bool start(uint32_t interval_s, uint32_t now);
   void stop() { _phase = OFF; }
-  //: Report now rather than at the next slot. For the fix that comes back
-  //: after a "no fix" report: the base's last word from this unit is that it
-  //: does not know where it is, and that must not stand for an interval
-  //: once it does. From SLEEP, or from a FIX waiting on a slot or a sample;
-  //: in LISTEN a report has just gone.
+  //: Report now rather than at the next cycle - for the fix that comes back
+  //: after a "no fix" report - but only while free-running. A slotted unit
+  //: waits for its slot, fix or no fix: off its moment it lands on another
+  //: unit's (2026-11-08). From SLEEP or FIX; in LISTEN a report has just gone.
   void reportNow(uint32_t now);
 
   bool on() const { return _phase != OFF; }

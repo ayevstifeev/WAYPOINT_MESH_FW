@@ -343,8 +343,15 @@ public:
         display.setTextSize(1);
         // A pin and a message fail the same way and must not be reported
         // the same way: somebody who dropped a pin needs to know THAT is
-        // what nobody has.
-        const char* what = the_mesh.textIsMarker() ? "PIN" : "MSG";
+        // what nobody has. A message is named by who it is for, since a
+        // message can go to the base or to any unit, and "DELIVERED" is
+        // only half an answer without "to whom".
+        const uint8_t to = the_mesh.textTo();
+        char what[12];
+        if (the_mesh.textIsMarker()) strcpy(what, "PIN");
+        else if (to == slim::ADDR_BASE) strcpy(what, "BASE");
+        else if (to == slim::ADDR_BROADCAST) strcpy(what, "MSG");
+        else the_mesh.slimRecipientName(to, what, sizeof(what));
         if (msg_state == 1) {
           display.setColor(DisplayDriver::YELLOW);
           sprintf(tmp, "%s SENDING %u/3", what, (unsigned)the_mesh.textTries());
@@ -357,9 +364,12 @@ public:
           sprintf(tmp, "%s SENT", what);
         } else if (msg_state == 4) {
           // Not lost: kept, and sent the moment the base is heard again - a
-          // message as well as a pin since 2026-10-29.
+          // message as well as a pin since 2026-10-29. One to a unit waits
+          // for that unit: see MyMesh::resumePin.
           display.setColor(DisplayDriver::YELLOW);
-          sprintf(tmp, "%s HELD TILL BASE", what);
+          if (the_mesh.textIsMarker()) strcpy(tmp, "PIN HELD TILL BASE");
+          else if (to == slim::ADDR_BASE) strcpy(tmp, "MSG HELD TILL BASE");
+          else sprintf(tmp, "HELD TILL %s", what);
         } else {
           display.setColor(DisplayDriver::RED);
           sprintf(tmp, "%s NOT DELIVERED", what);
@@ -658,11 +668,14 @@ public:
         strcpy(tmp, the_mesh.hereNow(here_lat, here_lon)
                       ? "here" : "no fix yet");
       } else {
-        // Where a reply would actually go. A Send page that does not
-        // say where it sends is the one thing it must not be.
-        const uint8_t to = the_mesh.slimReplyTo();
-        if (to) sprintf(tmp, "to unit %u", (unsigned)to);
-        else strcpy(tmp, "to base");
+        // Who it can go to: the list that opens next says exactly who,
+        // with the base at the top.
+#ifdef WITH_TRACKER_MODE
+        strcpy(tmp, the_mesh.noBase() ? "everyone or a unit"
+                                      : "base or a unit");
+#else
+        strcpy(tmp, "base or a unit");
+#endif
       }
       display.setColor(DisplayDriver::YELLOW);
       display.setTextSize(1);
@@ -902,6 +915,12 @@ class MsgPreviewScreen : public UIScreen {
     uint32_t timestamp;
     char origin[62];
     char msg[78];
+#ifdef WITH_SLIM_UI
+    //: Who sent it, as a unit number, so answering it goes back to them
+    //: rather than to whoever happened to send something last. 0: nobody
+    //: who can be answered.
+    uint8_t unit;
+#endif
   };
   #define MAX_UNREAD_MSGS   32
   //: How many are new, and how many are still here to read.
@@ -947,6 +966,17 @@ public:
       sprintf(p->origin, "(%d) %s:", (uint32_t) path_len, from_name);
     }
     StrHelper::strncpy(p->msg, msg, sizeof(p->msg));
+#ifdef WITH_SLIM_UI
+    // From the callsign it arrived under - the one thing every path that
+    // reaches this screen, addressed or team, agrees on. MSHCMD carries no
+    // number and is the base, unit 15, as loadSlimRoster maps it.
+    uint8_t role = 0, number = 0;
+    p->unit = 0;
+    if (slimcompanion::unitFromCallsign(from_name, role, number)) {
+      p->unit = (role == slimcodec::ROLE_BASE && number == 0)
+                    ? slim::ADDR_BASE : number;
+    }
+#endif
   }
 
   int render(DisplayDriver& display) override {
@@ -1044,10 +1074,15 @@ public:
 #endif
 #ifdef WITH_SLIM_UI
     // Answering is what somebody wants next, and reading the message
-    // is the only moment they know who to answer.
+    // is the only moment they know who to answer - so the answer goes to
+    // the sender of the message on the screen, without asking again.
+    // Anything with no sender to answer opens the list instead.
     if (c == KEY_LEFT) {
       num_unread = 0;
-      _task->gotoSend();
+      const uint8_t from = num_msgs > 0
+          ? unread[(head + MAX_UNREAD_MSGS - _at) % MAX_UNREAD_MSGS].unit : 0;
+      if (from && from != slimproto::unit()) _task->gotoSendTo(from);
+      else _task->gotoSend();
       return true;
     }
 
@@ -1317,7 +1352,7 @@ public:
         // frame is queued. The home screen carries it from here.
         _task->showAlert("Placing pin...", 1000);
       } else {
-        const bool sent = the_mesh.sendSlimText(out);
+        const bool sent = the_mesh.sendSlimText(out, _task->sendTo());
         // See CannedScreen::chose: the home screen says what became of it.
         _task->showAlert(sent ? "Sending..." : "Could not send", 1000);
         if (!sent) _task->notify(UIEventType::trackerLost);
@@ -1330,8 +1365,10 @@ public:
 };
 
 //: What to say, cheapest first. The last row is how to say something that is
-//: not on the list.
+//: not on the list. Titled with who it goes to, chosen a step before.
 class CannedScreen : public PickScreen {
+  char _head[24];
+
 protected:
   const char* label(uint8_t i) override {
     return i < slimtext::CODE_COUNT ? slimtext::CODES[i] : "Type a message";
@@ -1340,7 +1377,60 @@ protected:
 
 public:
   CannedScreen(UITask* task)
-    : PickScreen(task, "Send", (uint8_t)(slimtext::CODE_COUNT + 1)) { }
+    : PickScreen(task, "Send", (uint8_t)(slimtext::CODE_COUNT + 1)) {
+    _head[0] = 0;
+  }
+
+  void setTo(const char* name) {
+    snprintf(_head, sizeof(_head), "To %s", name);
+    _title = _head;
+  }
+};
+
+//: Who a message goes to: the base first, then every tracker this unit
+//: knows, each with when it was last heard. A unit nobody has heard for
+//: twenty minutes is one a message may not reach, and the person choosing
+//: should know that before they press, not after.
+class RecipientScreen : public PickScreen {
+  uint8_t _to[slim::ADDR_COUNT];
+  char _row[slim::ADDR_COUNT][22];
+
+protected:
+  const char* label(uint8_t i) override { return _row[i]; }
+  void chose(uint8_t i) override { _task->gotoSendTo(_to[i]); }
+
+public:
+  RecipientScreen(UITask* task) : PickScreen(task, "Send to", 1) {
+    _to[0] = slim::ADDR_BASE;
+    strcpy(_row[0], "Base");
+  }
+
+  //: Built at every opening: units are heard, and go quiet, all the time.
+  void open() {
+    _n = the_mesh.slimRecipients(_to, slim::ADDR_COUNT);
+    if (_n == 0) {                  // never: the first row is always there
+      _to[0] = slim::ADDR_BASE;
+      _n = 1;
+    }
+    _sel = 0;                       // the base, at the top
+    for (uint8_t i = 0; i < _n; i++) {
+      char name[12];
+      the_mesh.slimRecipientName(_to[i], name, sizeof(name));
+      const long ago = _to[i] == slim::ADDR_BROADCAST
+                           ? -2 : the_mesh.slimHeardAgo(_to[i]);
+      if (ago == -2) {
+        snprintf(_row[i], sizeof(_row[i]), "%s", name);
+      } else if (ago < 0) {
+        snprintf(_row[i], sizeof(_row[i]), "%-7s not heard", name);
+      } else if (ago < 60) {
+        snprintf(_row[i], sizeof(_row[i]), "%-7s just now", name);
+      } else if (ago < 3600) {
+        snprintf(_row[i], sizeof(_row[i]), "%-7s %ldm ago", name, ago / 60);
+      } else {
+        snprintf(_row[i], sizeof(_row[i]), "%-7s %ldh ago", name, ago / 3600);
+      }
+    }
+  }
 };
 
 //: How strong the link to the base is, from where this unit is standing.
@@ -1555,7 +1645,7 @@ void CannedScreen::chose(uint8_t i) {
     _task->composeFor(ComposeScreen::NO_ICON);
     return;
   }
-  const bool sent = the_mesh.sendSlimText(slimtext::CODES[i]);
+  const bool sent = the_mesh.sendSlimText(slimtext::CODES[i], _task->sendTo());
   // "Sending", not "Sent": all that has happened is that the frame is
   // queued. The home screen carries it from here and chirps when the base
   // acknowledges it - see MyMesh::Outgoing.
@@ -1602,7 +1692,17 @@ int UITask::msgsUnread() const {
 int UITask::msgsKept() const {
   return ((MsgPreviewScreen *) msg_preview)->keptCount();
 }
-void UITask::gotoSend() { setCurrScreen(send_menu); }
+void UITask::gotoSend() {
+  ((RecipientScreen *) to_menu)->open();
+  setCurrScreen(to_menu);
+}
+void UITask::gotoSendTo(uint8_t to) {
+  _send_to = to;
+  char name[12];
+  the_mesh.slimRecipientName(to, name, sizeof(name));
+  ((CannedScreen *) send_menu)->setTo(name);
+  setCurrScreen(send_menu);
+}
 void UITask::gotoMarker() { setCurrScreen(marker_menu); }
 void UITask::gotoLinkTest() { setCurrScreen(link_test); }
 void UITask::gotoSettings() { setCurrScreen(settings_menu); }
@@ -1660,6 +1760,8 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   msg_preview = new MsgPreviewScreen(this, &rtc_clock);
 #ifdef WITH_SLIM_UI
   send_menu = new CannedScreen(this);
+  to_menu = new RecipientScreen(this);
+  _send_to = slim::ADDR_BASE;
   marker_menu = new MarkerScreen(this);
   every_menu = new TrackerScreen(this);
   link_test = new LinkTestScreen(this);
